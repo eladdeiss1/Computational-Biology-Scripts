@@ -1,3 +1,11 @@
+#Upstream files
+*.fastq.gz
+*.fastq
+*.bam
+*.sam
+data/raw/
+results/
+
 # History files
 .Rhistory
 .Rapp.history
