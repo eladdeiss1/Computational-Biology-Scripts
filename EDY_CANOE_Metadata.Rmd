@@ -1,0 +1,888 @@
+---
+title: "Metadata Merge with Phyloseq Object"
+author: "Elad Deiss-Yehiely"
+date: "2025-02-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+#load required R packages
+library(vegan)
+library(phyloseq)
+library(DESeq2)
+library(plyr)
+library(dplyr)
+library(picante)
+library(ggplot2)
+library(ggrepel)
+library(kableExtra)
+library(ggpubr)
+library(gridExtra)
+library(cowplot)
+library(RColorBrewer)
+library(pheatmap)
+library(cluster)
+library(factoextra)
+library(dendextend)
+library(tidyverse)
+library(writexl)
+library(EnvStats) 
+library(phangorn)
+library(lme4)  #for mixed model  
+library(stats)
+library(reshape2)
+
+#set working directory
+#setwd("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/MERGE/")
+
+```
+
+```{r}
+#Taking the merged sample sheet used for this phyloseq object, along with the sample manifest from Emma, and merging them into one new dataframe, merged_df.
+
+#df <- read.csv("CANOE_UpperAirway_Merged_SampleSheet.csv")
+df <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Airway Sample Sequencing/CANOE_SAMPLE_SHEET_COMPLETE_3Runs.csv", skip = 19)
+#df_Emma <- read.csv("CANOE_8Trays_UCSF_10Dec2024.csv")
+df_Emma_Kris_merge <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Airway Sample Sequencing/Merged_3Runs_Emma_Kris_Manifests.csv")
+merged_df <- merge(df,df_Emma_Kris_merge, by.x = "SampleID", by.y = "Specimen_ID", all=TRUE)
+merged_df$Group <- tolower(merged_df$Group)
+#Some of the samples are labeled as "children - newborn" whereas some are labeled as "child - newborn", so I want to replace all instances of "children - newborn" and replace with "child - newborn". The same is true for "child - 4 months" and "child - 4months"
+merged_df$Group <- gsub("children - newborn", "child - newborn", merged_df$Group)
+merged_df$Group <- gsub("child - newborn visit", "child - newborn", merged_df$Group)
+merged_df$Group <- gsub("child - 4months", "child - 4 months", merged_df$Group)
+#Removing UWIM0173A duplicate 4 month data, as there were two that were sequenced and therefore can confuse downstream analysis.
+merged_df <- merged_df[merged_df$UW_ID != 1073, ]
+#Removing VAUN0023A duplicate Newborn data, as there were two that were sequenced and therefore can confuse downstream analysis.
+merged_df <- merged_df[merged_df$UW_ID != 123, ]
+#Removing VAUN0099A duplicate Newborn data, as there were two that were sequenced and therefore can confuse downstream analysis.
+merged_df <- merged_df[merged_df$UW_ID != 362, ]
+
+
+```
+
+```{r}
+#Here I am loading in the first sheet to get any mothers who have more than one child enrolled in CANOE, so that later sheets do not run into issues with duplicates.
+
+mother_mapping <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_1.csv")
+duplicated_mothers <- unique(mother_mapping$canoe_pid_mother[duplicated(mother_mapping$canoe_pid_mother)])
+print(duplicated_mothers)
+
+```
+
+```{r}
+###Sheet 2, Demographics###
+
+#Now I would like to start loading in all the different data sets from CANOE into the merged_df, combining them by the Subject_ID and collection timepoint.
+#Note that dem_c_2 has a value of 1 for male, 2 for female.
+
+demographics <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_2.csv")
+merged_df <- left_join(merged_df,demographics, by = c("Subject_ID" = "canoe_pid_child"))
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+##Note that the code becomes quite repetitive for each of the sheets, though some require additional action based on their data. There probably is a quicker way to loop through each sheet, but for now I have done it one by one in each code chunk. 
+```
+
+
+```{r}
+###Sheet 3, SCORAD###
+
+#I need to do add a column for each of the given time-points, so the merge can make the new column a binary (or continuous variable) and repeat for all three of the DNA sequences (newborn, 4, 12 months) in the phyloseq object.
+
+#Need to include omitted cells as NA for downstream, since we cannot (and should not) assume empty is 0.
+SCORAD <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_3.csv",na.string = "")
+#We want to merge the timepoints that do exist for SCORAD into the specific values, and not make new columns for them. Therefore, we will merge only 4 and 12 month values.
+SCORAD$scorad_visit <- paste0("child - ",SCORAD$scorad_visit)
+SCORAD$scorad_visit <-tolower(SCORAD$scorad_visit)
+merged_df <- left_join(merged_df,SCORAD,by = c("Subject_ID" = "canoe_pid_child","Group" = "scorad_visit"))
+#write.csv(merged_df,"/Users/ediessy/Desktop/merge_metadata_edited.csv",row.names=FALSE)
+
+#Now, we want to create a new column for each value in each timepoint that is not 0, 4, or 12 months of age
+colnum_previous <- ncol(merged_df)
+timepoints_SCORAD <- as.list(unique(SCORAD$scorad_visit))
+timepoints_SCORAD <- timepoints_SCORAD[!timepoints_SCORAD %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_SCORAD_sorted <- timepoints_SCORAD[order(as.numeric(gsub("[^0-9]", "", timepoints_SCORAD)))]
+unique_qs_SCORAD <- as.list(colnames(SCORAD[5:ncol(SCORAD)]))
+for (value_1 in timepoints_SCORAD_sorted) {
+  for(qs in unique_qs_SCORAD){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+
+#Now running through each subject to add to their age column the corresponding values for timepoints outside of those included in the phyloseq object.
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  # Get Subject_ID from merged_df
+  
+# Check if the subject has data for "18 months" in SCORAD, and do this for all of the timepoints in sheet 3 that exist outside of those already included in the phyloseq object (18, 24, 36, and NOT 4, 12). Need if for each because we could have multiple instances of older times for a given participant. 
+## Note that the only fixed variables are the timepoints of the child and the column to start the questions at. These will be sheet specific and must be determined ahead of time.
+  if (subject_id_temp %in% SCORAD$canoe_pid_child[SCORAD$scorad_visit == "child - 18 months"]) {
+    merged_df[j,(colnum_previous+1):(colnum_previous+length(unique_qs_SCORAD))] <- SCORAD[SCORAD$canoe_pid_child == subject_id_temp & SCORAD$scorad_visit == "child - 18 months", 5:ncol(SCORAD)]
+  }
+  if (subject_id_temp %in% SCORAD$canoe_pid_child[SCORAD$scorad_visit == "child - 24 months"]) {
+    merged_df[j,(colnum_previous+(1)+length(unique_qs_SCORAD)):(colnum_previous+(2*length(unique_qs_SCORAD)))] <- SCORAD[SCORAD$canoe_pid_child == subject_id_temp & SCORAD$scorad_visit == "child - 24 months", 5:ncol(SCORAD)]
+  }
+  if (subject_id_temp %in% SCORAD$canoe_pid_child[SCORAD$scorad_visit == "child - 36 months"]) {
+    merged_df[j,(colnum_previous+1+(2*length(unique_qs_SCORAD))):(colnum_previous+(3*length(unique_qs_SCORAD)))] <- SCORAD[SCORAD$canoe_pid_child == subject_id_temp & SCORAD$scorad_visit == "child - 36 months", 5:ncol(SCORAD)]
+  }
+}
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+```{r}
+###Sheet 4, Infant Airway (12 months ONLY)###
+
+airway_baby <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_4.csv", na.strings="")
+airway_baby$subject_description <- "child - 12 months"
+merged_df <- left_join(merged_df,airway_baby,by = c("Subject_ID" = "canoe_pid","Group" = "subject_description"))
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+```{r}
+###Sheet 5, Atopy (sIGE)###
+
+atopy <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_5.csv", na.strings="")
+#We want to merge the timepoints that do exist for SCORAD into the specific values, and not make new columns for them. Therefore, only 12 month timepoints will merge here.
+atopy$subject_description <-tolower(atopy$subject_description)
+merged_df <- left_join(merged_df,atopy,by = c("Subject_ID" = "subject_id","Group" = "subject_description"))
+write.csv(merged_df,"/Users/ediessy/Desktop/merge_metadata_edited.csv",row.names=FALSE)
+
+#Because we only have 12 month data in the phyloseq object, need to include 24-month data as its own columns and for all participants.
+colnum_previous <- ncol(merged_df)
+timepoints_atopy <- as.list(unique(atopy$subject_description))
+timepoints_atopy <- timepoints_atopy[!timepoints_atopy %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_atopy_sorted <- timepoints_atopy[order(as.numeric(gsub("[^0-9]", "", timepoints_atopy)))]
+unique_qs_atopy <- as.list(colnames(atopy[6:ncol(atopy)]))
+for (value_1 in timepoints_atopy_sorted) {
+  for(qs in unique_qs_atopy){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+#See SCORAD Sheet 3 code chunk for explanations
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  
+  #Only including "child - 24 months" because we know that these are the only timepoints included in the atopy sheet. Can change and add more if statements if other timepoints are included in the future.
+  if (subject_id_temp %in% atopy$subject_id[atopy$subject_description == "child - 24 months"]) {
+    merged_df[j,(colnum_previous+(1)):(colnum_previous+length(unique_qs_atopy))] <- atopy[atopy$subject_id == subject_id_temp & atopy$subject_description == "child - 24 months", 6:ncol(atopy)]
+  }
+}
+
+#write.csv(merged_df,"/Users/ediessy/Desktop/merge_metadata_edited.csv",row.names=FALSE)
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+```
+
+```{r}
+###Sheet 6, Airway Disease###
+
+airway <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_6_03242025.csv", na.strings="")
+airway$air2_ec_visit <- paste0("child - ",airway$air2_ec_visit)
+airway$air2_ec_visit <-tolower(airway$air2_ec_visit)
+merged_df <- left_join(merged_df,airway,by = c("Subject_ID" = "canoe_pid","Group" = "air2_ec_visit"))
+
+
+# Need to include 18-, 24-, and 36-month data into new columns from this sheet, similar to SCORAD. 
+colnum_previous <- ncol(merged_df)
+timepoints_airway <- as.list(unique(airway$air2_ec_visit))
+timepoints_airway <- timepoints_airway[!timepoints_airway %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_airway_sorted <- timepoints_airway[order(as.numeric(gsub("[^0-9]", "", timepoints_airway)))]
+unique_qs_airway <- as.list(colnames(airway[5:ncol(airway)]))
+for (value_1 in timepoints_airway_sorted) {
+  for(qs in unique_qs_airway){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  # Get Subject_ID from merged_df
+  
+ #Need to include 18-, 24-, and 36-month data into new columns from this sheet.
+  if (subject_id_temp %in% airway$canoe_pid[airway$air2_ec_visit == "child - 18 months"]) {
+    merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_airway)))] <- airway[airway$canoe_pid == subject_id_temp & airway$air2_ec_visit == "child - 18 months", 5:ncol(airway)]
+  }
+  if (subject_id_temp %in% airway$canoe_pid[airway$air2_ec_visit == "child - 24 months"]) {
+    merged_df[j,(colnum_previous+(1)+length((unique_qs_airway))):(colnum_previous+(2*length((unique_qs_airway))))] <- airway[airway$canoe_pid == subject_id_temp & airway$air2_ec_visit == "child - 24 months", 5:ncol(airway)]
+  }
+  if (subject_id_temp %in% airway$canoe_pid[airway$air2_ec_visit == "child - 36 months"]) {
+    merged_df[j,(colnum_previous+1+(2*length((unique_qs_airway)))):(colnum_previous+(3*length((unique_qs_airway))))] <- airway[airway$canoe_pid == subject_id_temp & airway$air2_ec_visit == "child - 36 months", 5:ncol(airway)]
+  }
+}
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+
+```{r}
+###Sheet 8, Antibiotic Usage### ###NEED TO CHECK THIS EACH TIME TO MAKE SURE DRUGS ARE APTLY NAMED AND REMOVED###
+
+#Changed the column to text for q5, q12, q19
+antibiotics <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_8.csv", na.strings="")
+antibiotics$mediec_c_visit <- paste0("child - ",antibiotics$mediec_c_visit)
+antibiotics$mediec_c_visit <- tolower(antibiotics$mediec_c_visit)
+
+antibiotics <- antibiotics %>%
+  mutate(across(where(is.character), ~na_if(.,"")))
+
+# Clean column first, and then order in which you grepl matters for making sure that augmentin is properly defined first so that amox doesn't include amox/clav!
+antibiotics <- antibiotics %>%
+  mutate(
+    Drug1_clean = str_trim(str_to_lower(mediec_c_ab_q5)),
+    Drug2_clean = str_trim(str_to_lower(mediec_c_ab_q12)),
+    Drug3_clean = str_trim(str_to_lower(mediec_c_ab_q19))
+  )
+
+drug_columns <- c("Drug1_clean", "Drug2_clean", "Drug3_clean")
+augmentin_pattern <- "amoxicillin/clav|amoxicillin clav|augmen|moxicillin/clav|ab02"
+amoxicillin_pattern <- "amox|ab01|4a"
+ampicillin_pattern <- "ampic"
+azithromycin_pattern <- "azithro|zithro"
+bactroban_pattern <- "bactro|mupiro"
+cefdinir_pattern <- "cefdi|omnic|cefi"
+cephalexin_pattern <- "cephal|kefl|kelf|cephl"
+clindamycin_pattern <- "4i - |clinda"
+erythromycin_pattern <- "eryth|erith|erryth"
+gentamicin_pattern <- "genta"
+na_pattern <-"na|n/a|unk|uns|do not|don't|i don't||other|0|?"
+oflaxacin_pattern <- "oflax"
+penicillin_pattern <- "bicill|penicil|phenoxymethylpeni"
+polytrim_pattern <- "trimethoprim-poly"
+sulfatrim_pattern <- "sulfameth"
+tobramycin_pattern <- "tobr"
+
+for (col in drug_columns) {
+  antibiotics[[col]][grepl(augmentin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "augmentin"
+  antibiotics[[col]][grepl(amoxicillin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "amoxicillin"
+  antibiotics[[col]][grepl(ampicillin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "ampicillin"
+  antibiotics[[col]][grepl(azithromycin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "azithromycin"
+  antibiotics[[col]][grepl(bactroban_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "bactroban"
+  antibiotics[[col]][grepl(cefdinir_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "cefdinir"
+  antibiotics[[col]][grepl(cephalexin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "cephalexin"
+  antibiotics[[col]][grepl(erythromycin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "erythromycin"
+  antibiotics[[col]][grepl(oflaxacin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "oflaxacin"
+  antibiotics[[col]][grepl(penicillin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "penicillin"
+  antibiotics[[col]][grepl(gentamicin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "gentamicin"
+  antibiotics[[col]][grepl(tobramycin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "tobramycin"
+  antibiotics[[col]][grepl(clindamycin_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "clindamycin"
+  antibiotics[[col]][grepl(sulfatrim_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "sulfatrim"
+  antibiotics[[col]][grepl(polytrim_pattern, antibiotics[[col]], ignore.case = TRUE)] <- "polytrim"
+  }
+
+
+merged_df <- left_join(merged_df,antibiotics,by = c("Subject_ID" = "canoe_pid","Group" = "mediec_c_visit"))
+
+#This is used to remove instances of participants having time points in which both EMR and Participant response are included. 
+merged_df <- merged_df %>%
+  group_by(SampleID) %>%
+  filter(!(n() > 1 & response_type == "EMR")) %>%
+  ungroup()
+
+# Need to include 18-, 24-, and 36-month data into new columns from this sheet, similar to SCORAD. 
+colnum_previous <- ncol(merged_df)
+timepoints_antibiotics <- as.list(unique(antibiotics$mediec_c_visit))
+timepoints_antibiotics <- timepoints_antibiotics[!timepoints_antibiotics %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_antibiotics_sorted <- timepoints_antibiotics[order(as.numeric(gsub("[^0-9]", "", timepoints_antibiotics)))]
+unique_qs_antibiotics <- as.list(colnames(antibiotics[5:ncol(antibiotics)]))
+for (value_1 in timepoints_antibiotics_sorted) {
+  for(qs in unique_qs_antibiotics){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  
+  
+  if (subject_id_temp %in% antibiotics$canoe_pid[antibiotics$mediec_c_visit == "child - 18 months" & antibiotics$response_type == "Participant report"]) {
+    merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_antibiotics)))] <- antibiotics[antibiotics$canoe_pid == subject_id_temp & antibiotics$mediec_c_visit == "child - 18 months" & antibiotics$response_type == "Participant report", 5:ncol(antibiotics)]
+  }
+  if (subject_id_temp %in% antibiotics$canoe_pid[antibiotics$mediec_c_visit == "child - 24 months" & antibiotics$response_type == "Participant report"]) {
+    merged_df[j,(colnum_previous+1+length(unique_qs_antibiotics)):(colnum_previous+(2*length((unique_qs_antibiotics))))] <- antibiotics[antibiotics$canoe_pid == subject_id_temp & antibiotics$mediec_c_visit == "child - 24 months" & antibiotics$response_type == "Participant report", 5:ncol(antibiotics)]
+  }
+  if (subject_id_temp %in% antibiotics$canoe_pid[antibiotics$mediec_c_visit == "child - 36 months" & antibiotics$response_type == "Participant report"]) {
+    merged_df[j,(colnum_previous+1+(2*length(unique_qs_antibiotics))):(colnum_previous+(3*length((unique_qs_antibiotics))))] <- antibiotics[antibiotics$canoe_pid == subject_id_temp & antibiotics$mediec_c_visit == "child - 36 months" & antibiotics$response_type == "Participant report", 5:ncol(antibiotics)]
+  }
+}
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+
+```{r}
+### Sheet 10, Number of Children at Home###
+
+Num_children <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_10.csv", na.strings="")
+Num_children$hhc_c_visit <- paste0("child - ",Num_children$hhc_c_visit)
+Num_children$hhc_c_visit <- tolower(Num_children$hhc_c_visit)
+
+#No timepoint in alignment with the phyloseq object here, so no need to left_join.
+#merged_df <- left_join(merged_df,Num_children,by = c("Subject_ID" = "canoe_pid_child","Group" = "hhc_c_visit"))
+
+
+# Need to include 2- and 15-month data into new columns from this sheet, similar to SCORAD. 
+colnum_previous <- ncol(merged_df)
+timepoints_Num_children <- as.list(unique(Num_children$hhc_c_visit))
+timepoints_Num_children <- timepoints_Num_children[!timepoints_Num_children %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_Num_children_sorted <- timepoints_Num_children[order(as.numeric(gsub("[^0-9]", "", timepoints_Num_children)))]
+unique_qs_Num_children <- as.list(colnames(Num_children[5:ncol(Num_children)]))
+for (value_1 in timepoints_Num_children_sorted) {
+  for(qs in unique_qs_Num_children){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  
+  
+  if (subject_id_temp %in% Num_children$canoe_pid_child[Num_children$hhc_c_visit == "child - 2 months"]) {
+    merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_Num_children)))] <- Num_children[Num_children$canoe_pid_child == subject_id_temp & Num_children$hhc_c_visit == "child - 2 months", 5:ncol(Num_children)]
+  }
+  if (subject_id_temp %in% Num_children$canoe_pid_child[Num_children$hhc_c_visit == "child - 15 months"]) {
+    merged_df[j,(colnum_previous+1+length(unique_qs_Num_children)):(colnum_previous+(2*length((unique_qs_Num_children))))] <- Num_children[Num_children$canoe_pid_child == subject_id_temp & Num_children$hhc_c_visit == "child - 15 months", 5:ncol(Num_children)]
+  }
+}
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+```{r}
+###Sheet 12, Delivery Route###
+
+delivery_unedited <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_12.csv", na.strings="")
+delivery <- delivery_unedited
+delivery$pmci_visit <- paste0("child - ",delivery$pmci_visit)
+delivery$pmci_visit <- tolower(delivery$pmci_visit)
+delivery$canoe_pid_child <- delivery[[2]]
+
+#Renaming the copied column of mother IDs to now end with A or A2 instead of M or M2
+delivery$canoe_pid_child <- ifelse(
+  grepl("M2$", delivery$canoe_pid_child),  # Check if it ends with 'M2'
+  paste0(substr(delivery$canoe_pid_child, 1, nchar(delivery$canoe_pid_child) - 2), "A2"),  # Replace 'M2' with 'A2'
+  ifelse(
+    grepl("M$", delivery$canoe_pid_child),  # Check if it ends with 'M'
+    paste0(substr(delivery$canoe_pid_child, 1, nchar(delivery$canoe_pid_child) - 1), "A"),  # Replace last 'M' with 'A'
+    delivery$canoe_pid_child  # Otherwise, leave unchanged
+  )
+)
+#For those mothers who have multiple children in CANOE, I made a new row of each of them and renamed the child "B" instead of "A". I checked that there are no mothers who end in M2 that have a second child, so I did not include this edge case.
+matching_rows <- which(delivery$canoe_pid_mother %in% duplicated_mothers)
+for (row_index in matching_rows) {
+  row_to_copy <- delivery[row_index,]
+  next_row <- nrow(delivery) +1
+  delivery[next_row,] <- row_to_copy
+  delivery[next_row, 3] <- paste0(substr(delivery[next_row,3],1,nchar(delivery[next_row,3])-1),"B")
+}
+
+#The 4-month data collection time point lines up with the phyloseq object, which means that you can left_join. The answers to the prenatal questions, such as mother's asthma status, should be included in the same row as this left_join.
+merged_df <- left_join(merged_df, delivery, by = c("Subject_ID" = "canoe_pid_child", "Group" = "pmci_visit"))
+
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+```
+
+```{r}
+###Sheet 13, Parental Asthma Status###
+
+#Note that I changed WUSL0045M at 9-months in the original data file to WUSL0045A, as this makes the merging much easier and is the only instance in which there is a M at 9 months that there is not an A as well. This is already accounted for in the March 25th, 2025 folder.
+
+parental_asthma_unedited <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_13.csv", na.strings="")
+parental_asthma <- parental_asthma_unedited
+parental_asthma$canoe_pid_child <- parental_asthma[[2]]
+#Renaming the copied column of mother IDs to now end with A or A2 instead of M or M2
+parental_asthma$canoe_pid_child <- ifelse(
+  grepl("M2$", parental_asthma$canoe_pid),  # Check if it ends with 'M2'
+  paste0(substr(parental_asthma$canoe_pid, 1, nchar(parental_asthma$canoe_pid) - 2), "A2"),  # Replace 'M2' with 'A2'
+  ifelse(
+    grepl("M$", parental_asthma$canoe_pid),  # Check if it ends with 'M'
+    paste0(substr(parental_asthma$canoe_pid, 1, nchar(parental_asthma$canoe_pid) - 1), "A"),  # Replace last 'M' with 'A'
+    parental_asthma$canoe_pid  # Otherwise, leave unchanged
+  )
+)
+
+#For those mothers who have multiple children in CANOE, I made a new row of each of them and renamed the child "B" instead of "A". I checked that there are no mothers who end in M2 that have a second child, so I did not include this edge case. For this sheet, it seems there are no children as B (2/20/2025).
+matching_rows <- which(parental_asthma$canoe_pid %in% duplicated_mothers)
+for (row_index in matching_rows) {
+  row_to_copy <- parental_asthma[row_index,]
+  next_row <- nrow(parental_asthma) +1
+  parental_asthma[next_row,] <- row_to_copy
+  parental_asthma[next_row, 9] <- paste0(substr(parental_asthma[next_row,9],1,nchar(parental_asthma[next_row,9])-1),"B")
+}
+
+#Making sure all the nomenclature for the time of the visit lines up with merged_df. 
+k <- 1
+for (k in 1:nrow(parental_asthma)){
+  if (parental_asthma$mh2_bf_visit[k] == "Prenatal") {
+    parental_asthma$mh2_bf_visit[k] <- "child - newborn"
+  }
+}
+parental_asthma$mh2_bf_visit <-tolower(parental_asthma$mh2_bf_visit)
+
+#Here is where we need to think about 9 and 33 month timepoints and merging them into newborn
+
+# Step 1: Find rows where the canoe_pid repeats
+duplicated_pid <- duplicated(parental_asthma$canoe_pid_child) | duplicated(parental_asthma$canoe_pid_child, fromLast = TRUE)
+
+# Step 2: Subset the rows with duplicated canoe_pid
+duplicates <- parental_asthma[duplicated_pid, ]
+
+# Step 3: Check if mh2_bf_2a_fam___1 matches mh2_bf_2a_fam___2 for those rows
+mismatch_rows <- duplicates[duplicates$mh2_bf_2a_fam___1 != duplicates$mh2_bf_2a_fam___2, ]
+
+# Step 4: If you want to see the results
+mismatch_rows
+
+
+
+
+duplicated_pid_all <- duplicated(parental_asthma$canoe_pid_child) | duplicated(parental_asthma$canoe_pid_child, fromLast = TRUE)
+
+
+duplicates_all <- parental_asthma[duplicated_pid_all, ]
+sa_values <- split(duplicates_all$mh2_bf_2a, duplicates_all$canoe_pid_child)
+mismatches <- sapply(sa_values, function(x) {
+  non_na <- na.omit(x)
+  length(non_na) > 1 && length(unique(non_na)) > 1
+})
+mismatch_ids <- names(mismatches[mismatches])
+
+
+# #Making sure all the nomenclature for the time of the visit lines up with merged_df
+# k <- 1
+# for (k in 1:nrow(parental_asthma)){
+#   if (parental_asthma$mh2_bf_visit[k] == "9 months" | parental_asthma$mh2_bf_visit[k] == "33 months"){
+#     parental_asthma$mh2_bf_visit[k] <- paste0("child - ",parental_asthma$mh2_bf_visit[k])
+#   }
+#   else {
+#     parental_asthma$mh2_bf_visit[k] <- gsub("Prenatal","child - newborn",parental_asthma$mh2_bf_visit[k])
+#   }
+# }
+# parental_asthma$mh2_bf_visit <-tolower(parental_asthma$mh2_bf_visit)
+
+#Merges all the instances of when the mother filled out the timesheet with the newborn phyloseq object time point.
+parental_asthma_filtered <- parental_asthma[parental_asthma$mh2_bf_visit == "child - newborn", ]
+merged_df <- left_join(merged_df, parental_asthma_filtered, 
+                       by = c("Subject_ID" = "canoe_pid_child", "Group" = "mh2_bf_visit"))
+
+# #Need these variables to add to columns after left_join in newborn case (see if statement below)
+# colnum_previous <- ncol(merged_df)
+# unique_qs_parental_asthma <- as.list(colnames(parental_asthma_unedited[6:ncol(parental_asthma_unedited)]))
+# timepoints_parental_asthma <- as.list(unique(parental_asthma_unedited$mh2_bf_visit))
+# timepoints_parental_asthma <- timepoints_parental_asthma[!timepoints_parental_asthma %in% c("child - newborn", "child - 4 months","child - 12 months")]
+# timepoints_parental_asthma_sorted <- timepoints_parental_asthma[order(as.numeric(gsub("[^0-9]", "", timepoints_parental_asthma)))]
+# unique_qs_parental_asthma <- as.list(colnames(parental_asthma_unedited[6:ncol(parental_asthma_unedited)]))
+# for (value_1 in timepoints_parental_asthma_sorted) {
+#   for(qs in unique_qs_parental_asthma){
+#     colname <- paste0(value_1,"_",qs)
+#     merged_df[[colname]] <- NA
+#   }
+# }
+
+# j <- 1
+# for (j in 1:nrow(merged_df)) {
+#   subject_id_temp <- merged_df$Subject_ID[j]  
+#   #Using else if here because I do not want to join the same ID multiple times. Here we do not want to left_join but instead add data into columns that were made by the first if statement. 
+#   if (subject_id_temp %in% parental_asthma$canoe_pid_child[parental_asthma$mh2_bf_visit == "child - 9 months"]) { 
+#     merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_parental_asthma)))] <- parental_asthma[parental_asthma$canoe_pid_child == subject_id_temp & parental_asthma$mh2_bf_visit == "child - 9 months", 6:ncol(parental_asthma_unedited)]
+#   }
+#   else if (subject_id_temp %in% parental_asthma$canoe_pid_child[parental_asthma$mh2_bf_visit == "child - 33 months"]) { 
+#     merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_parental_asthma)))] <- parental_asthma[parental_asthma$canoe_pid_child == subject_id_temp & parental_asthma$mh2_bf_visit == "child - 33 months", 6:ncol(parental_asthma_unedited)]
+#   }  
+# }
+#   
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+
+```{r}
+###Sheet 15, Maternal Street###
+
+stress_unedited <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_15.csv", na.strings="")
+stress <- stress_unedited
+k <- 1
+for (k in 1:nrow(stress)){
+  if (stress$pdep8a_visit[k] == "6 months" | stress$pdep8a_visit[k] == "30 months"){
+    stress$pdep8a_visit[k] <- paste0("child - ",stress$pdep8a_visit[k])
+  }
+  else {
+    stress$pdep8a_visit[k] <- gsub("Prenatal","child - newborn",stress$pdep8a_visit[k])
+  }
+}
+stress$pdep8a_visit <-tolower(stress$pdep8a_visit)
+
+stress$canoe_pid_child <- stress[[2]]
+#Renaming the copied column of mother IDs to now end with A or A2 instead of M or M2
+stress$canoe_pid_child <- ifelse(
+  grepl("M2$", stress$canoe_pid),  # Check if it ends with 'M2'
+  paste0(substr(stress$canoe_pid, 1, nchar(stress$canoe_pid) - 2), "A2"),  # Replace 'M2' with 'A2'
+  ifelse(
+    grepl("M$", stress$canoe_pid),  # Check if it ends with 'M'
+    paste0(substr(stress$canoe_pid, 1, nchar(stress$canoe_pid) - 1), "A"),  # Replace last 'M' with 'A'
+    stress$canoe_pid_child  # Otherwise, leave unchanged
+  )
+)
+
+#For those mothers who have multiple children in CANOE, I made a new row of each of them and renamed the child "B" instead of "A". I checked that there are no mothers who end in M2 that have a second child, so I did not include this edge case.
+matching_rows <- which(delivery$canoe_pid_mother %in% duplicated_mothers)
+for (row_index in matching_rows) {
+  row_to_copy <- delivery[row_index,]
+  next_row <- nrow(delivery) +1
+  delivery[next_row,] <- row_to_copy
+  delivery[next_row, 3] <- paste0(substr(delivery[next_row,3],1,nchar(delivery[next_row,3])-1),"B")
+}
+
+#Similar to other sheets, 6 and 30 month time points are not included and must be for inclusion of all data collected.
+colnum_previous <- ncol(merged_df)
+timepoints_stress <- as.list(unique(stress$pdep8a_visit))
+timepoints_stress <- timepoints_stress[!timepoints_stress %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_stress_sorted <- timepoints_stress[order(as.numeric(gsub("[^0-9]", "", timepoints_stress)))]
+unique_qs_stress <- as.list(colnames(stress_unedited[5:ncol(stress_unedited)]))
+for (value_1 in timepoints_stress_sorted) {
+  for(qs in unique_qs_stress){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  
+  if (subject_id_temp %in% stress$canoe_pid[stress$pdep8a_visit == "child - 6 months"]) { 
+    merged_df[j, (colnum_previous+1) : (colnum_previous+(length(unique_qs_stress)))] <- stress[stress$canoe_pid == subject_id_temp & stress$pdep8a_visit == "child - 6 months", 5:ncol(stress_unedited)]
+  }
+  if (subject_id_temp %in% stress$canoe_pid[stress$pdep8a_visit == "child - 30 months"]) { 
+    merged_df[j,(colnum_previous+1+(2*length((unique_qs_stress)))):(colnum_previous+(3*length((unique_qs_stress))))] <- stress[stress$canoe_pid == subject_id_temp & stress$pdep8a_visit == "child - 30 months", 6:ncol(stress_unedited)]
+  }  
+}
+
+#Merges all the instances of when the mother filled out the timesheet with the newborn phyloseq object time point. 
+stress_filtered <- stress[stress$pdep8a_visit == "child - newborn", ]
+merged_df <- left_join(merged_df, stress_filtered, 
+                       by = c("Subject_ID" = "canoe_pid_child", "Group" = "pdep8a_visit"))
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+```
+
+```{r}
+###Sheet 16, Baby Feeding Information###
+
+feeding <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR072_DATA_FILE_16.csv", na.string = "")
+feeding$ifp_visit <- paste0("child - ",feeding$ifp_visit)
+feeding$ifp_visit <-tolower(feeding$ifp_visit)
+#We only have 6 and 9 month data here, which do not align with the phyloseq object, so we do not need to merge.
+#merged_df <- left_join(merged_df,SCORAD,by = c("Subject_ID" = "canoe_pid_child","Group" = "scorad_visit"))
+
+
+#Now, we want to create a new column for each value in each timepoint that is not 0, 4, or 12 months of age
+colnum_previous <- ncol(merged_df)
+timepoints_feeding <- as.list(unique(feeding$ifp_visit))
+timepoints_feeding <- timepoints_feeding[!timepoints_feeding %in% c("child - newborn", "child - 4 months","child - 12 months")]
+timepoints_feeding_sorted <- timepoints_feeding[order(as.numeric(gsub("[^0-9]", "", timepoints_feeding)))]
+unique_qs_feeding <- as.list(colnames(feeding[5:ncol(feeding)]))
+for (value_1 in timepoints_feeding_sorted) {
+  for(qs in unique_qs_feeding){
+    colname <- paste0(value_1,"_",qs)
+    merged_df[[colname]] <- NA
+  }
+}
+
+
+#Now running through each subject to add to their age column the corresponding values for time points outside of those included in the phyloseq object.
+j <- 1
+for (j in 1:nrow(merged_df)) {
+  subject_id_temp <- merged_df$Subject_ID[j]  
+  
+  if (subject_id_temp %in% feeding$canoe_pid_child[feeding$ifp_visit == "child - 6 months"]) {
+    merged_df[j,(colnum_previous+1):(colnum_previous+length(unique_qs_feeding))] <- feeding[feeding$canoe_pid_child == subject_id_temp & feeding$ifp_visit == "child - 6 months", 5:ncol(feeding)]
+  }
+  if (subject_id_temp %in% feeding$canoe_pid_child[feeding$ifp_visit == "child - 9 months"]) {
+    merged_df[j,(colnum_previous+(1)+length(unique_qs_feeding)):(colnum_previous+(2*length(unique_qs_feeding)))] <- feeding[feeding$canoe_pid_child == subject_id_temp & feeding$ifp_visit == "child - 9 months", 5:ncol(feeding)]
+  }
+}
+
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+```{r}
+###Breastmilk Metabolomics Data###
+breastmilk <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/BreastMilk_Data/CR046_CANOE_maternal_sample_collection_DATA_03172025.csv", na.string = "")
+milk_metabolomics <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/BreastMilk_Data/sample_metatdata_breastmilk_QMAC.csv")
+merged_breastmilk_df <- left_join(milk_metabolomics, breastmilk, 
+                       by = c("Breast.Milk.Specimen.ID" = "primary_specimen_id" ))
+merged_breastmilk_df <- merged_breastmilk_df %>%
+  mutate(canoe_pid = sub("M2$", "A2", canoe_pid_mother),
+         canoe_pid = sub("M$", "A", canoe_pid))
+#To get a copy of child B for duplicate mothers
+duplicate_rows <- merged_breastmilk_df %>%
+  filter(canoe_pid_mother %in% duplicated_mothers)
+duplicate_rows_modified <- duplicate_rows %>%
+  mutate(canoe_pid = sub("A", "B", canoe_pid))
+merged_breastmilk_df_updated <- bind_rows(merged_breastmilk_df, duplicate_rows_modified)
+
+###Ran an error but could be very important 7/16/25!!###
+
+#merged_breastmilk_df_updated <- merged_breastmilk_df_updated %>%
+  #select(-Sample.Class,-X)
+
+
+merged_breastmilk_df_updated$group_visit <-tolower(merged_breastmilk_df_updated$group_visit)
+merged_df <- left_join(merged_df,merged_breastmilk_df_updated,by = c("Subject_ID" = "canoe_pid"))
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+```{r}
+###Outcome data via Sweta Singh from CANOE Data Team###
+outcomes <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072_CANOE_OUTCOMES_DATA_11172025.csv")
+merged_df <- left_join(merged_df,outcomes,by = c("Subject_ID" = "canoe_pid_child"))
+write.csv(merged_df,paste0("/Users/ediessy/Desktop/merge_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=FALSE)
+
+```
+
+
+```{r}
+###Mother IgE (Prenatal only), taken from CR046 data###
+mother_IgE <- read.csv("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/CR072 Data delivery/CR072 Data delivery 03252025/CR046_CANOE_serum_ige_DATA_03132025.csv", na.strings = "")
+
+# Standardize timepoint label to match conventions used throughout
+mother_IgE$subject_description <- tolower(mother_IgE$subject_description)
+
+# Filter to prenatal timepoint only
+mother_IgE_prenatal <- mother_IgE[mother_IgE$subject_description == "mother - prenatal", ]
+
+# Drop columns not needed in final metadata sheet
+cols_to_drop <- c("lab_num", "daci_lab", "spec_id", "Unnamed..7", "data_sent_dt", "subject_description", "X")
+mother_IgE_prenatal <- mother_IgE_prenatal[, !colnames(mother_IgE_prenatal) %in% cols_to_drop]
+
+# There are two duplicate mother IDs in the prenatal data (VAUN0161M, UWIM0052M),
+# each with one row containing NA for total_ige_kupl. We keep the non-NA row per mother.
+# If both rows have values (unlikely but possible), we keep the first occurrence.
+mother_IgE_prenatal <- mother_IgE_prenatal[order(mother_IgE_prenatal$subject_id, is.na(mother_IgE_prenatal$total_ige_kupl)), ]
+mother_IgE_prenatal <- mother_IgE_prenatal[!duplicated(mother_IgE_prenatal$subject_id), ]
+
+# Add mother_prenatal_ prefix to all IgE measurement columns to avoid name collisions
+# with child IgE values already present in merged_df (e.g. from Sheet 5 atopy).
+colnames(mother_IgE_prenatal)[colnames(mother_IgE_prenatal) != "subject_id"] <- 
+  paste0("mother_prenatal_", colnames(mother_IgE_prenatal)[colnames(mother_IgE_prenatal) != "subject_id"])
+
+# Bridge from mother ID to child ID using mother_mapping (loaded in chunk 1).
+# This correctly handles twins and second children (e.g. UWIM0001A, UWIM0001A2, UWIM0001B)
+# since mother_mapping has one row per child linked to canoe_pid_mother.
+mother_IgE_prenatal_mapped <- merge(mother_IgE_prenatal, mother_mapping,
+                                     by.x = "subject_id",
+                                     by.y = "canoe_pid_mother",
+                                     all.x = TRUE)
+
+# Drop the mother ID and any unwanted columns brought in from mother_mapping
+cols_to_drop_mapping <- c("subject_id", "familyid", "canoe_site", 
+                           "participant_status_mother", "participant_status_child")
+mother_IgE_prenatal_mapped <- mother_IgE_prenatal_mapped[, !colnames(mother_IgE_prenatal_mapped) %in% cols_to_drop_mapping]
+
+# Remove placeholder rows where canoe_pid_child is "-6" (sentinel value in mother_mapping
+# for mothers with no matched child record) or NA (mother not found in mother_mapping at all).
+mother_IgE_prenatal_mapped <- mother_IgE_prenatal_mapped[
+  !is.na(mother_IgE_prenatal_mapped$canoe_pid_child) & 
+  mother_IgE_prenatal_mapped$canoe_pid_child != "-6", ]
+
+# Sanity check: confirm no duplicate child IDs remain (would cause many-to-many).
+# Twins/second children are expected to each have their own row here (one per child, not a duplicate).
+stopifnot(!any(duplicated(mother_IgE_prenatal_mapped$canoe_pid_child)))
+
+# Merge into merged_df by child ID. Since maternal IgE is not timepoint-specific,
+# it will attach identically to all timepoint rows (newborn, 4 months, 12 months) for that child.
+merged_df <- left_join(merged_df, mother_IgE_prenatal_mapped,
+                        by = c("Subject_ID" = "canoe_pid_child"))
+
+write.csv(merged_df, paste0("/Users/ediessy/Desktop/merge_metadata_edited_", Sys.Date(), "_EDY.csv"), row.names = FALSE)
+```
+
+##Here we start forming the metadata to work in downstream analyses:
+```{r}
+###From CR072 Writing Team Meeting 02 (3/17/25), we defined the four variables of interest.###
+
+  #Not enough data to make any substantial conclusions about IgE
+  #Eczema can either be defined as ever or current. Ever would need to either have correctly been defined by ISAAC questioning AND/OR a SCORAD objective score of >= 1. Current if the ISAAC questions line up with the time in which DNA was extracted
+  #Chronic rhinitis used instead of hay fever. Chronic rhinitis ever is yes to ec_c1 at 24 months. Chronic rhinitis currently needs a yes to answer to ec_c2-4 in the past 12 months, and the denominator of total participants would be the number in ec_c1. 
+  #Recurrent wheeze is most broadly defined as at least 2 episodes of wheeze with at least 1 in the past year. For age 24 months, this could be >= 2 wheeze events in the past 12 months OR wheeze ever in the first 12 months and then >= 1 wheeze event in the past 12 months. This can either be either ever (thinking mostly for 36-months whereby at 24 there was a yes but not at 36) or current. Wheeze ever at age 1 is another variable that can be used as a binary yes/no.
+```
+
+```{r}
+###I will start with the already completed Metadata Merged file and then edit accordingly to run MetadeconfoundR. This seems much better, and will account for edge cases better, than trying to start for the beginning. In general, keeping more metadata columns, then will run prevalence filters and co-linearity analyses to further prune before using MetaDeconfoundR.###
+
+#Read in the metadata file and remove any rows that are not sequenced samples, rename row names and remove the duplicate row names.
+formatted_merged_df <- read.csv("/Users/ediessy/Desktop/merge_metadata_edited_2025-12-09_EDY.csv") #Note that the date will change each time, need to update accordingly!!
+formatted_merged_df <- formatted_merged_df[grepl("^(UWIM|HFHS|WUSL|VAUN)", formatted_merged_df$SampleID), ]
+rownames(formatted_merged_df) <- formatted_merged_df[[1]]
+formatted_merged_df <- formatted_merged_df[,-1]
+
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("Sample_Plate", "Sample_Well", "Study", "Extractor", "SampleType", "Sequence_Type", "Run", "UW_ID"))]
+
+#Remove all negative numbers, which correspond to missing information according to the data dictionary. Not important for this analysis, but will be considered in other scenarios.
+formatted_merged_df[formatted_merged_df == -5] <- NA
+formatted_merged_df[formatted_merged_df == -6] <- NA
+formatted_merged_df[formatted_merged_df == -7] <- NA
+formatted_merged_df[formatted_merged_df == -8] <- NA
+formatted_merged_df[formatted_merged_df == -9] <- NA
+
+#To check and see if all instances of -6 (either numeric or character) are removed.
+any(formatted_merged_df == -6, na.rm = TRUE)
+any(formatted_merged_df == "-6", na.rm = TRUE)
+
+#Recode the Sex as 0 for Male, 1 for Female, so MetaDeconfoundR can run properly. I moved it to the beginning because MetaD needs a binary column to start in order to run properly.
+formatted_merged_df$sex <- formatted_merged_df$dem_c_2
+3 %in% formatted_merged_df$sex
+#Changes all instances of 1 in to TRUE (which is coded as male) and all other instances as FALSE (coded as female).  
+formatted_merged_df$sex <- formatted_merged_df$sex == 1
+formatted_merged_df <- formatted_merged_df %>%
+  dplyr::select(sex, everything())
+
+# #Making columns for each of the four sites as binary 1=Yes and 0=No
+# unique_sites <- na.omit(unique(formatted_merged_df$canoe_site.x))
+# formatted_merged_df <- formatted_merged_df %>%
+#   bind_cols(lapply(unique_sites, function(site_value) {
+#     # For each unique site, create a new column with 1 if the site matches and 0 otherwise
+#     setNames(as.data.frame(ifelse(formatted_merged_df$canoe_site.x == site_value, 1, 0)), paste0("SITE_", site_value))
+#   }))
+
+#Recoding Group to be a continuous variable as months called Age
+formatted_merged_df <- formatted_merged_df %>%
+  mutate(Age = dplyr::recode(Group,
+                            "child - newborn" = 0,
+                            "child - 4 months" = 4,
+                            "child - 12 months" = 12))
+
+##NEED TO MAKE SURE THAT WE CHANGE THE TYPE TO LOGICAL FOR A GIVEN COLUMN, AND IF CATEGORICAL WE NEED TO HAVE EACH FACTOR BE ITS OWN ROW.
+
+
+
+##### All of these may need to be changed with updated metadata variables (i.e. 24 month data)!! ######
+
+#Removing columns again that are unnecessary from Form 2, or are already coded in at the end (like sex).
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("Dilute_DNA", "Dilute_Water", "Plate", "Well","site.x", "dem_c_formdt", "dem_c_3_type___1", "dem_c_3_type___2", "dem_c_3_type___3", "dem_c_3_type___4", "dem_c_3_sp", "dem_c_4_aian_sp", "dem_c_4_asian_sp","dem_c_4_hawaii_sp","dem_c_4_oth_sp"))]
+
+
+#Form 3:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.y", "scorad_q1_specify", "scorad_q2", "X.x",  "scorad_q8", "child...18.months_scorad_q1_specify", "child...18.months_scorad_q2", "child...18.months_scorad_q8", "child...18.months_X", "child...24.months_scorad_q1_specify", "child...24.months_scorad_q2", "child...24.months_scorad_q8", "child...24.months_X", "child...36.months_scorad_q1_specify", "child...36.months_scorad_q2", "child...36.months_scorad_q8", "child...36.months_X"))]
+
+#Form 4:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("site.y", "air_inf_formdt", "air_inf_a3", "air_inf_a4a", "air_inf_a5f_sp", "air_inf_b1a_sp", "air_inf_c1b", "air_inf_d4"))]
+
+#Form 5:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.x.x", "X.y", "sample_received_dt", "spec_id", "data_sent_dt"))]
+
+#Form 6:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.y.y", "air2_ec_formdt", "air2_ec_a1a", "air2_ec_a1a_recall", "air2_ec_a4a", "air2_ec_a6a", "air2_ec_a8b1", "air2_ec_a9l_sp", "air2_ec_b1b", "air2_ec_cj_sp", "air2_ec_c10", "air2_ec_d1a_sp", "air2_ec_d2a_sp", "air2_ec_e3", "air2_ec_e4a", "child...18.months_air2_ec_a1a", "child...18.months_air2_ec_a1a_recall", "child...18.months_air2_ec_a4a", "child...18.months_air2_ec_a6a", "child...18.months_air2_ec_a8b1", "child...18.months_air2_ec_a9l_sp", "child...18.months_air2_ec_b1b", "child...18.months_air2_ec_cj_sp", "child...18.months_air2_ec_c10", "child...18.months_air2_ec_d1a_sp", "child...18.months_air2_ec_d2a_sp", "child...18.months_air2_ec_e3", "child...18.months_air2_ec_e4a", "child...24.months_air2_ec_a1a", "child...24.months_air2_ec_a1a_recall", "child...24.months_air2_ec_a4a", "child...24.months_air2_ec_a6a", "child...24.months_air2_ec_a8b1", "child...24.months_air2_ec_a9l_sp", "child...24.months_air2_ec_b1b", "child...24.months_air2_ec_cj_sp", "child...24.months_air2_ec_c10", "child...24.months_air2_ec_d1a_sp", "child...24.months_air2_ec_d2a_sp", "child...24.months_air2_ec_e3", "child...24.months_air2_ec_e4a", "child...36.months_air2_ec_a1a", "child...36.months_air2_ec_a1a_recall", "child...36.months_air2_ec_a4a", "child...36.months_air2_ec_a6a", "child...36.months_air2_ec_a8b1", "child...36.months_air2_ec_a9l_sp", "child...36.months_air2_ec_b1b", "child...36.months_air2_ec_cj_sp", "child...36.months_air2_ec_c10", "child...36.months_air2_ec_d1a_sp", "child...36.months_air2_ec_d2a_sp", "child...36.months_air2_ec_e3", "child...36.months_air2_ec_e4a"))]
+
+#Form 7 (Need to think about this much more... Maybe cumulative antibiotic days, number of courses, etc.): 
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.x.x.x", "mediec_c_date", "mediec_c_q1", "mediec_c_q2", "response_type", "mediec_c_ab_q1", "mediec_c_ab_q2", "mediec_c_q3a", "mediec_c_q3b", "mediec_c_ab_q3_dk", "mediec_c_ab_q4w_oth", "mediec_c_ab_q4y_oth", "mediec_c_ab_q7", "mediec_cab_q7_oth", "mediec_c_ab_q8", "mediec_c_ab_q8_dk", "mediec_c_ab_q9_oth", "mediec_c_ab_q10_dk", "mediec_c_ab_q11_oth", "mediec_c_ab_q11a_oth", "mediec_c_ab_q11b_oth", "mediec_cab_q14_oth", "mediec_c_ab_q15_dk", "mediec_c_ab_q15", "mediec_c_ab_q16_oth", "mediec_c_ab_q17_dk", "mediec_c_ab_q18_oth", "mediec_c_ab_q18a_oth", "mediec_c_ab_q18b_oth", "mediec_cab_q21_oth", "mediec_c_ab_q22", "mediec_c_ab_q22_dk", "mediec_c_ab_q23_oth", "mediec_c_ab_q24_dk", "mediec_c_ab_q25_oth", "mediec_c_ab_q25a_oth", "mediec_c_ab_q25b_oth", "mediec_c_ab_more", "mediec_c_af_q3_dk", "mediec_c_af_q4l_oth", "mediec_caf_q7_oth", "mediec_c_af_q8", "mediec_c_af_q8_dk", "mediec_c_af_q9_oth", "mediec_c_af_q10_dk", "mediec_c_af_q11_oth", "mediec_c_af_q11a_oth", "mediec_caf_q14_oth", "mediec_c_af_q15", "mediec_c_af_q15_dk", "mediec_c_af_q16_oth", "mediec_c_af_q17_dk", "mediec_c_af_q18_oth", "mediec_c_af_q18a_oth", "mediec_caf_q21_oth", "mediec_c_af_q22", "mediec_c_af_q22_dk", "mediec_c_af_q23_oth", "mediec_c_af_q24_dk", "mediec_c_af_q25_oth", "mediec_c_af_q25a_oth", "mediec_c_af_more", "mediec_cpb_q6_oth", "mediec_c_pb_q7", "mediec_c_pb_q7_dk", "mediec_c_pb_q8_dk", "mediec_c_pb_q9a_specify", "mediec_cpb_q12_oth", "mediec_c_pb_q13_dk", "mediec_c_pb_q14_dk", "mediec_c_pb_q15_specify", "mediec_c_pb_q15a_specify", "mediec_cpb_q18_oth", "mediec_c_pb_q19_dk", "mediec_c_pb_q21_specify", "mediec_c_pb_q21a_specify", "mediec_c_pb_more", 
+"child...18.months_response_type", "child...18.months_mediec_c_ab_q1", "child...18.months_mediec_c_ab_q2", "child...18.months_mediec_c_q3a", "child...18.months_mediec_c_q3b", "child...18.months_mediec_c_ab_q3_dk", "child...18.months_mediec_c_ab_q4w_oth", "child...18.months_mediec_c_ab_q4y_oth", "child...18.months_mediec_c_ab_q7", "child...18.months_mediec_cab_q7_oth", "child...18.months_mediec_c_ab_q8", "child...18.months_mediec_c_ab_q8_dk", "child...18.months_mediec_c_ab_q9_oth", "child...18.months_mediec_c_ab_q10_dk", "child...18.months_mediec_c_ab_q11_oth", "child...18.months_mediec_c_ab_q11a_oth", "child...18.months_mediec_c_ab_q11b_oth", "child...18.months_mediec_cab_q14_oth", "child...18.months_mediec_c_ab_q15_dk", "child...18.months_mediec_c_ab_q15", "child...18.months_mediec_c_ab_q16_oth", "child...18.months_mediec_c_ab_q17_dk", "child...18.months_mediec_c_ab_q18_oth", "child...18.months_mediec_c_ab_q18a_oth", "child...18.months_mediec_c_ab_q18b_oth", "child...18.months_mediec_cab_q21_oth", "child...18.months_mediec_c_ab_q22", "child...18.months_mediec_c_ab_q22_dk", "child...18.months_mediec_c_ab_q23_oth", "child...18.months_mediec_c_ab_q24_dk", "child...18.months_mediec_c_ab_q25_oth", "child...18.months_mediec_c_ab_q25a_oth", "child...18.months_mediec_c_ab_q25b_oth", "child...18.months_mediec_c_ab_more", "child...18.months_mediec_c_af_q3_dk", "child...18.months_mediec_c_af_q4l_oth", "child...18.months_mediec_caf_q7_oth", "child...18.months_mediec_c_af_q8", "child...18.months_mediec_c_af_q8_dk", "child...18.months_mediec_c_af_q9_oth", "child...18.months_mediec_c_af_q10_dk", "child...18.months_mediec_c_af_q11_oth", "child...18.months_mediec_c_af_q11a_oth", "child...18.months_mediec_caf_q14_oth", "child...18.months_mediec_c_af_q15", "child...18.months_mediec_c_af_q15_dk", "child...18.months_mediec_c_af_q16_oth", "child...18.months_mediec_c_af_q17_dk", "child...18.months_mediec_c_af_q18_oth", "child...18.months_mediec_c_af_q18a_oth", "child...18.months_mediec_caf_q21_oth", "child...18.months_mediec_c_af_q22", "child...18.months_mediec_c_af_q22_dk", "child...18.months_mediec_c_af_q23_oth", "child...18.months_mediec_c_af_q24_dk", "child...18.months_mediec_c_af_q25_oth", "child...18.months_mediec_c_af_q25a_oth", "child...18.months_mediec_c_af_more", "child...18.months_mediec_cpb_q6_oth", "child...18.months_mediec_c_pb_q7", "child...18.months_mediec_c_pb_q7_dk", "child...18.months_mediec_c_pb_q8_dk", "child...18.months_mediec_c_pb_q9a_specify", "child...18.months_mediec_cpb_q12_oth", "child...18.months_mediec_c_pb_q13_dk", "child...18.months_mediec_c_pb_q14_dk", "child...18.months_mediec_c_pb_q15_specify", "child...18.months_mediec_c_pb_q15a_specify", "child...18.months_mediec_cpb_q18_oth", "child...18.months_mediec_c_pb_q19_dk", "child...18.months_mediec_c_pb_q21_specify", "child...18.months_mediec_c_pb_q21a_specify", "child...18.months_mediec_c_pb_more", 
+"child...24.months_response_type", "child...24.months_mediec_c_ab_q1", "child...24.months_mediec_c_ab_q2", "child...24.months_mediec_c_q3a", "child...24.months_mediec_c_q3b", "child...24.months_mediec_c_ab_q3_dk", "child...24.months_mediec_c_ab_q4w_oth", "child...24.months_mediec_c_ab_q4y_oth", "child...24.months_mediec_c_ab_q7", "child...24.months_mediec_cab_q7_oth", "child...24.months_mediec_c_ab_q8", "child...24.months_mediec_c_ab_q8_dk", "child...24.months_mediec_c_ab_q9_oth", "child...24.months_mediec_c_ab_q10_dk", "child...24.months_mediec_c_ab_q11_oth", "child...24.months_mediec_c_ab_q11a_oth", "child...24.months_mediec_c_ab_q11b_oth", "child...24.months_mediec_cab_q14_oth", "child...24.months_mediec_c_ab_q15_dk", "child...24.months_mediec_c_ab_q15", "child...24.months_mediec_c_ab_q16_oth", "child...24.months_mediec_c_ab_q17_dk", "child...24.months_mediec_c_ab_q18_oth", "child...24.months_mediec_c_ab_q18a_oth", "child...24.months_mediec_c_ab_q18b_oth", "child...24.months_mediec_cab_q21_oth", "child...24.months_mediec_c_ab_q22", "child...24.months_mediec_c_ab_q22_dk", "child...24.months_mediec_c_ab_q23_oth", "child...24.months_mediec_c_ab_q24_dk", "child...24.months_mediec_c_ab_q25_oth", "child...24.months_mediec_c_ab_q25a_oth", "child...24.months_mediec_c_ab_q25b_oth", "child...24.months_mediec_c_ab_more", "child...24.months_mediec_c_af_q3_dk", "child...24.months_mediec_c_af_q4l_oth", "child...24.months_mediec_caf_q7_oth", "child...24.months_mediec_c_af_q8", "child...24.months_mediec_c_af_q8_dk", "child...24.months_mediec_c_af_q9_oth", "child...24.months_mediec_c_af_q10_dk", "child...24.months_mediec_c_af_q11_oth", "child...24.months_mediec_c_af_q11a_oth", "child...24.months_mediec_caf_q14_oth", "child...24.months_mediec_c_af_q15", "child...24.months_mediec_c_af_q15_dk", "child...24.months_mediec_c_af_q16_oth", "child...24.months_mediec_c_af_q17_dk", "child...24.months_mediec_c_af_q18_oth", "child...24.months_mediec_c_af_q18a_oth", "child...24.months_mediec_caf_q21_oth", "child...24.months_mediec_c_af_q22", "child...24.months_mediec_c_af_q22_dk", "child...24.months_mediec_c_af_q23_oth", "child...24.months_mediec_c_af_q24_dk", "child...24.months_mediec_c_af_q25_oth", "child...24.months_mediec_c_af_q25a_oth", "child...24.months_mediec_c_af_more", "child...24.months_mediec_cpb_q6_oth", "child...24.months_mediec_c_pb_q7", "child...24.months_mediec_c_pb_q7_dk", "child...24.months_mediec_c_pb_q8_dk", "child...24.months_mediec_c_pb_q9a_specify", "child...24.months_mediec_cpb_q12_oth", "child...24.months_mediec_c_pb_q13_dk", "child...24.months_mediec_c_pb_q14_dk", "child...24.months_mediec_c_pb_q15_specify", "child...24.months_mediec_c_pb_q15a_specify", "child...24.months_mediec_cpb_q18_oth", "child...24.months_mediec_c_pb_q19_dk", "child...24.months_mediec_c_pb_q21_specify", "child...24.months_mediec_c_pb_q21a_specify", "child...24.months_mediec_c_pb_more",
+"child...36.months_response_type", "child...36.months_mediec_c_ab_q1", "child...36.months_mediec_c_ab_q2", "child...36.months_mediec_c_q3a", "child...36.months_mediec_c_q3b", "child...36.months_mediec_c_ab_q3_dk", "child...36.months_mediec_c_ab_q4w_oth", "child...36.months_mediec_c_ab_q4y_oth", "child...36.months_mediec_c_ab_q7", "child...36.months_mediec_cab_q7_oth", "child...36.months_mediec_c_ab_q8", "child...36.months_mediec_c_ab_q8_dk", "child...36.months_mediec_c_ab_q9_oth", "child...36.months_mediec_c_ab_q10_dk", "child...36.months_mediec_c_ab_q11_oth", "child...36.months_mediec_c_ab_q11a_oth", "child...36.months_mediec_c_ab_q11b_oth", "child...36.months_mediec_cab_q14_oth", "child...36.months_mediec_c_ab_q15_dk", "child...36.months_mediec_c_ab_q15", "child...36.months_mediec_c_ab_q16_oth", "child...36.months_mediec_c_ab_q17_dk", "child...36.months_mediec_c_ab_q18_oth", "child...36.months_mediec_c_ab_q18a_oth", "child...36.months_mediec_c_ab_q18b_oth", "child...36.months_mediec_cab_q21_oth", "child...36.months_mediec_c_ab_q22", "child...36.months_mediec_c_ab_q22_dk", "child...36.months_mediec_c_ab_q23_oth", "child...36.months_mediec_c_ab_q24_dk", "child...36.months_mediec_c_ab_q25_oth", "child...36.months_mediec_c_ab_q25a_oth", "child...36.months_mediec_c_ab_q25b_oth", "child...36.months_mediec_c_ab_more", "child...36.months_mediec_c_af_q3_dk", "child...36.months_mediec_c_af_q4l_oth", "child...36.months_mediec_caf_q7_oth", "child...36.months_mediec_c_af_q8", "child...36.months_mediec_c_af_q8_dk", "child...36.months_mediec_c_af_q9_oth", "child...36.months_mediec_c_af_q10_dk", "child...36.months_mediec_c_af_q11_oth", "child...36.months_mediec_c_af_q11a_oth", "child...36.months_mediec_caf_q14_oth", "child...36.months_mediec_c_af_q15", "child...36.months_mediec_c_af_q15_dk", "child...36.months_mediec_c_af_q16_oth", "child...36.months_mediec_c_af_q17_dk", "child...36.months_mediec_c_af_q18_oth", "child...36.months_mediec_c_af_q18a_oth", "child...36.months_mediec_caf_q21_oth", "child...36.months_mediec_c_af_q22", "child...36.months_mediec_c_af_q22_dk", "child...36.months_mediec_c_af_q23_oth", "child...36.months_mediec_c_af_q24_dk", "child...36.months_mediec_c_af_q25_oth", "child...36.months_mediec_c_af_q25a_oth", "child...36.months_mediec_c_af_more", "child...36.months_mediec_cpb_q6_oth", "child...36.months_mediec_c_pb_q7", "child...36.months_mediec_c_pb_q7_dk", "child...36.months_mediec_c_pb_q8_dk", "child...36.months_mediec_c_pb_q9a_specify", "child...36.months_mediec_cpb_q12_oth", "child...36.months_mediec_c_pb_q13_dk", "child...36.months_mediec_c_pb_q14_dk", "child...36.months_mediec_c_pb_q15_specify", "child...36.months_mediec_c_pb_q15a_specify", "child...36.months_mediec_cpb_q18_oth", "child...36.months_mediec_c_pb_q19_dk", "child...36.months_mediec_c_pb_q21_specify", "child...36.months_mediec_c_pb_q21a_specify", "child...36.months_mediec_c_pb_more",
+"child...48.months_response_type", "child...48.months_mediec_c_ab_q1", "child...48.months_mediec_c_ab_q2", "child...48.months_mediec_c_q3a", "child...48.months_mediec_c_q3b", "child...48.months_mediec_c_ab_q3_dk", "child...48.months_mediec_c_ab_q4w_oth", "child...48.months_mediec_c_ab_q4y_oth", "child...48.months_mediec_c_ab_q7", "child...48.months_mediec_cab_q7_oth", "child...48.months_mediec_c_ab_q8", "child...48.months_mediec_c_ab_q8_dk", "child...48.months_mediec_c_ab_q9_oth", "child...48.months_mediec_c_ab_q10_dk", "child...48.months_mediec_c_ab_q11_oth", "child...48.months_mediec_c_ab_q11a_oth", "child...48.months_mediec_c_ab_q11b_oth", "child...48.months_mediec_cab_q14_oth", "child...48.months_mediec_c_ab_q15_dk", "child...48.months_mediec_c_ab_q15", "child...48.months_mediec_c_ab_q16_oth", "child...48.months_mediec_c_ab_q17_dk", "child...48.months_mediec_c_ab_q18_oth", "child...48.months_mediec_c_ab_q18a_oth", "child...48.months_mediec_c_ab_q18b_oth", "child...48.months_mediec_cab_q21_oth", "child...48.months_mediec_c_ab_q22", "child...48.months_mediec_c_ab_q22_dk", "child...48.months_mediec_c_ab_q23_oth", "child...48.months_mediec_c_ab_q24_dk", "child...48.months_mediec_c_ab_q25_oth", "child...48.months_mediec_c_ab_q25a_oth", "child...48.months_mediec_c_ab_q25b_oth", "child...48.months_mediec_c_ab_more", "child...48.months_mediec_c_af_q3_dk", "child...48.months_mediec_c_af_q4l_oth", "child...48.months_mediec_caf_q7_oth", "child...48.months_mediec_c_af_q8", "child...48.months_mediec_c_af_q8_dk", "child...48.months_mediec_c_af_q9_oth", "child...48.months_mediec_c_af_q10_dk", "child...48.months_mediec_c_af_q11_oth", "child...48.months_mediec_c_af_q11a_oth", "child...48.months_mediec_caf_q14_oth", "child...48.months_mediec_c_af_q15", "child...48.months_mediec_c_af_q15_dk", "child...48.months_mediec_c_af_q16_oth", "child...48.months_mediec_c_af_q17_dk", "child...48.months_mediec_c_af_q18_oth", "child...48.months_mediec_c_af_q18a_oth", "child...48.months_mediec_caf_q21_oth", "child...48.months_mediec_c_af_q22", "child...48.months_mediec_c_af_q22_dk", "child...48.months_mediec_c_af_q23_oth", "child...48.months_mediec_c_af_q24_dk", "child...48.months_mediec_c_af_q25_oth", "child...48.months_mediec_c_af_q25a_oth", "child...48.months_mediec_c_af_more", "child...48.months_mediec_cpb_q6_oth", "child...48.months_mediec_c_pb_q7", "child...48.months_mediec_c_pb_q7_dk", "child...48.months_mediec_c_pb_q8_dk", "child...48.months_mediec_c_pb_q9a_specify", "child...48.months_mediec_cpb_q12_oth", "child...48.months_mediec_c_pb_q13_dk", "child...48.months_mediec_c_pb_q14_dk", "child...48.months_mediec_c_pb_q15_specify", "child...48.months_mediec_c_pb_q15a_specify", "child...48.months_mediec_cpb_q18_oth", "child...48.months_mediec_c_pb_q19_dk", "child...48.months_mediec_c_pb_q21_specify", "child...48.months_mediec_c_pb_q21a_specify", "child...48.months_mediec_c_pb_more"))]
+
+#Form 10: 
+
+#Form 12:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_sit.y.y.y", "canoe_pid_mother", "pmci_formdt", "air_adol_formdt", "air_adol_visit", "air_adol_a5a", "air_adol_a5a_recall"))]
+
+#Form 13 (Note that 9 months should be the same response as prenatal, think about collapsing these columns into 1, should be done upstream in the EDY_CANOE_metadata RMD):
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.x.x.x.x", "canoe_pid.x", "mh2_bf_formdt", "mh2_bf_questionnaire"))]
+
+#Form 15:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("canoe_site.y.y.y.y", "canoe_pid.y", "pdep8a_formdt", "pdep8a_1", "pdep8a_2", "pdep8a_3", "pdep8a_4", "pdep8a_5", "pdep8a_6", "pdep8a_7", "pdep8a_8"))]
+
+#Form 16:
+formatted_merged_df <- formatted_merged_df[, !(names(formatted_merged_df) %in% c("child...6.months_ifp_c08_sp", "child...9.months_ifp_c08_sp"))]
+
+```
+
+```{r}
+#Running through each column to change them to logical if they have values only 0 and 1
+for (col in names(formatted_merged_df)) {
+  vals <- unique(na.omit(formatted_merged_df[[col]]))
+  if (all(vals %in% c(0, 1))) {
+    formatted_merged_df[[col]] <- as.logical(formatted_merged_df[[col]])
+  }
+}
+
+write.csv(formatted_merged_df,paste0("/Users/ediessy/Desktop/formatted_merged_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=TRUE)
+```
+
+```{r}
+### Checking completeness of metadata, removing any zeros or single-answer responses ###
+
+norm_vals <- function(x,
+                      na_like = c("", "na", "n/a", "n\\a", "none", "null", "unknown", "missing")) {
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    v <- trimws(tolower(x))
+    v[v %in% na_like] <- NA
+    return(v)
+  }
+  x
+}
+
+uniq_non_na_count <- function(x) {
+  v <- norm_vals(x)
+  length(unique(v[!is.na(v)]))
+}
+
+# --- parameters ---
+pct_min <- 50  # drop if < 50% complete
+
+# --- build a normalized view once ---
+norm_df <- as.data.frame(lapply(formatted_merged_df, norm_vals), stringsAsFactors = FALSE)
+
+# robust completion %
+PctComplete_robust <- round(colMeans(!is.na(norm_df)) * 100, 1)
+
+# robust unique non-missing counts
+UniqueNonNA_robust <- sapply(norm_df, function(x) length(unique(x[!is.na(x)])))
+
+# columns to drop:
+#   - < 10% complete  OR  ≤ 1 unique non-missing value
+drop_cols <- names(which(PctComplete_robust < pct_min | UniqueNonNA_robust <= 1))
+
+# apply filter
+formatted_merged_df <- formatted_merged_df[, setdiff(names(formatted_merged_df), drop_cols), drop = FALSE]
+
+
+meta_quality <- tibble(
+  Variable      = names(formatted_merged_df),
+  Class         = sapply(formatted_merged_df, function(x) paste(class(x), collapse = ",")),
+  n             = nrow(formatted_merged_df),
+  NonMissing    = sapply(formatted_merged_df, function(x) sum(!is.na(x))),
+  Missing       = sapply(formatted_merged_df, function(x) sum(is.na(x))),
+  PctComplete   = round(colMeans(!is.na(formatted_merged_df))*100, 1),
+  UniqueNonNA   = sapply(formatted_merged_df, function(x) length(unique(x[!is.na(x)]))),
+  ExampleValues = sapply(formatted_merged_df, function(x) paste(utils::head(unique(x[!is.na(x)]), 3), collapse=", "))
+) %>% arrange(PctComplete, UniqueNonNA)
+
+# Nice table
+kable(meta_quality, caption = "Metadata completeness / uniqueness audit")
+
+
+write.csv(formatted_merged_df,paste0("/Users/ediessy/Desktop/formatted_merged_metadata_edited_",Sys.Date(),"_EDY.csv"),row.names=TRUE)
+```
+
