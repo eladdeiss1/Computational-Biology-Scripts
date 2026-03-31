@@ -24,10 +24,10 @@ library(ggrepel)
 library(patchwork)
  
 # Load your saved phyloseq object
-my_physeq <- readRDS("/Users/ediessy/Desktop/my_phyloseq.rds")
+my_physeq <- readRDS("/Users/ediessy/Desktop/phy_prev_10O_10R.rds")
  
 # -- Extract feature table and metadata -------------------------------------
-feat_table <- as.data.frame(t(otu_table(my_physeq)))
+feat_table <- as.data.frame(otu_table(my_physeq))
 meta       <- as.data.frame(sample_data(my_physeq))
  
 # Force clean data.frame (fixes the xtfrm error)
@@ -39,23 +39,39 @@ meta <- data.frame(lapply(meta, function(x) {
 meta$sequencing_depth <- sample_sums(my_physeq)
  
 # -- Fixed covariates --------------------------------------------------------
-SITE     <- "site_of_collection"   # <-- update to match your column name
+SITE     <- "canoe_site.x"
+meta$canoe_site.x <- factor(meta$canoe_site.x,
+                             levels = c("UWIM", "HFHS", "VAUN", "WUSL"))
 SEQDEPTH <- "sequencing_depth"
  
 # -- Define all primary outcomes to loop over --------------------------------
 #    Update these to exactly match your metadata column names
 OUTCOMES <- c(
-  "chronic_rhinitis_12mo",
-  "chronic_rhinitis_24mo",
-  "chronic_rhinitis_36mo"
-  # add more here as needed, e.g.:
-  # "chronic_rhinitis_48mo",
-  # "wheeze_12mo",
-  # "atopy_36mo"
+  "wheeze12m",
+  "chronic_rhinitis12m",
+  "atopic_dermatitis12m",
+  "food_allergy12m",
+  "wheeze24m",
+  "wheeze24m_current",
+  "chronic_rhinitis24m",
+  "chronic_rhinitis24m_current",
+  "atopic_dermatitis24m",
+  "atopic_dermatitis24m_current",
+  "food_allergy24m",
+  "food_allergy24m_current",
+  "wheeze36m",
+  "wheeze36m_current",
+  "chronic_rhinitis36m",
+  "chronic_rhinitis36m_current",
+  "atopic_dermatitis36m",
+  "atopic_dermatitis36m_current",
+  "food_allergy36m",
+  "food_allergy36m_current"
+  ### add more here as needed ###
 )
  
 # -- Output root directory ---------------------------------------------------
-OUTPUT_DIR <- "/Users/ediessy/Desktop/Postdoc UCSF/CANOE"
+OUTPUT_DIR <- "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/MaAsLiN3 Loop"
  
  
 # ===========================================================================
@@ -236,7 +252,7 @@ print(concordance_table)
 # 5.  SAVE TO DISK
 # ===========================================================================
  
-save_path <- file.path(OUTPUT_DIR, "maaslin3_master_results")
+save_path <- file.path("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/MaAsLiN3 Loop/maaslin3_master_results")
 dir.create(save_path, showWarnings = FALSE)
  
 # Full master results (all outcomes, both norms, both models)
@@ -319,22 +335,41 @@ make_volcano <- function(df,
  
 # Generate and save one volcano per outcome (TSS abundance)
 for (outcome in OUTCOMES) {
- 
-  plot_data <- master_results %>%
-    filter(outcome == !!outcome,
-           norm  == "TSS + LOG",
-           model == "Abundance")
- 
-  if (nrow(plot_data) == 0) next
- 
-  p <- make_volcano(plot_data,
-                    title = paste0("TSS + LOG | Abundance\n", outcome))
- 
+
+  v_TSS_abund <- master_results %>%
+    filter(outcome == !!outcome, norm == "TSS + LOG", model == "Abundance") %>%
+    make_volcano(title = "TSS + LOG  |  Abundance")
+
+  v_TSS_prev <- master_results %>%
+    filter(outcome == !!outcome, norm == "TSS + LOG", model == "Prevalence") %>%
+    make_volcano(title = "TSS + LOG  |  Prevalence")
+
+  v_CLR_abund <- master_results %>%
+    filter(outcome == !!outcome, norm == "CLR", model == "Abundance") %>%
+    make_volcano(title = "CLR  |  Abundance")
+
+  v_CLR_prev <- master_results %>%
+    filter(outcome == !!outcome, norm == "CLR", model == "Prevalence") %>%
+    make_volcano(title = "CLR  |  Prevalence")
+
+  composite <- (v_TSS_abund | v_TSS_prev) /
+               (v_CLR_abund  | v_CLR_prev) +
+    plot_annotation(
+      title    = outcome,
+      subtitle = "MaAsLiN3 — TSS+LOG vs CLR, Abundance vs Prevalence",
+      theme    = theme(
+        plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 11, color = "grey40")
+      )
+    )
+
   ggsave(
-    filename = file.path(save_path, paste0("volcano_TSS_", outcome, ".pdf")),
-    plot     = p,
-    width    = 8, height = 6
+    filename = file.path(save_path, paste0("volcano_2x2_", outcome, ".pdf")),
+    plot     = composite,
+    width    = 14, height = 11
   )
+
+  message("Saved composite plot for: ", outcome)
 }
  
 cat("Volcano plots saved.\n")
