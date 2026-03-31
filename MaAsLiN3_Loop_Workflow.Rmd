@@ -43,6 +43,7 @@ SITE     <- "canoe_site.x"
 meta$canoe_site.x <- factor(meta$canoe_site.x,
                              levels = c("UWIM", "HFHS", "VAUN", "WUSL"))
 SEQDEPTH <- "sequencing_depth"
+SUBJECT_ID <- "Subject_ID"
  
 # -- Define all primary outcomes to loop over --------------------------------
 #    Update these to exactly match your metadata column names
@@ -72,7 +73,18 @@ OUTCOMES <- c(
  
 # -- Output root directory ---------------------------------------------------
 OUTPUT_DIR <- "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/MaAsLiN3 Loop"
- 
+
+tax_lookup <- as.data.frame(tax_table(my_physeq)) %>%
+  rownames_to_column("feature") %>%
+  mutate(
+    tax_label = case_when(
+      !is.na(Genus)  & Genus  != "" ~ Genus,
+      !is.na(Family) & Family != "" ~ paste0(Family, " (Family)"),
+      !is.na(Order)  & Order  != "" ~ paste0(Order,  " (Order)"),
+      TRUE ~ feature
+    )
+  ) %>%
+  select(feature, Kingdom, Phylum, Class, Order, Family, Genus, tax_label)
  
 # ===========================================================================
 # 1.  HELPER FUNCTIONS
@@ -92,9 +104,9 @@ run_maaslin <- function(feat_table, meta, outcome_var,
     input_data                   = feat_table,
     input_metadata               = meta,
     output                       = output_path,
-    formula                      = paste0("~ ", outcome_var, " + ",
-                                          SEQDEPTH, " + ", SITE),
-    normalization                = norm,
+    formula = paste0("~ ", outcome_var, " + ", SEQDEPTH, " + ", SITE,
+                 " + (1|", SUBJECT_ID, ")"),
+        normalization                = norm,
     transform                    = transform,
     augment                      = TRUE,
     standardize                  = TRUE,
@@ -193,6 +205,19 @@ for (outcome in OUTCOMES) {
 # ===========================================================================
  
 master_results <- bind_rows(all_results_list)
+
+# ADD THE JOIN HERE — after master_results exists but before saving
+master_results <- master_results %>%
+  left_join(tax_lookup, by = "feature") %>%
+  group_by(tax_label) %>%
+  mutate(
+    tax_label_unique = if_else(
+      n_distinct(feature) > 1,
+      paste0(tax_label, " (", feature, ")"),
+      tax_label
+    )
+  ) %>%
+  ungroup()
  
 # Reorder columns for readability
 master_results <- master_results %>%
@@ -204,14 +229,61 @@ master_results <- master_results %>%
  
 cat("\nMaster results dimensions:", nrow(master_results), "rows x",
     ncol(master_results), "cols\n")
- 
+
+master_results <- master_results %>%
+  left_join(tax_lookup, by = "feature")
+
+master_results <- master_results %>%
+  group_by(tax_label) %>%
+  mutate(
+    tax_label_unique = if_else(
+      n_distinct(feature) > 1,
+      paste0(tax_label, " (", feature, ")"),  # e.g. "Bacteroides (ASV_042)"
+      tax_label
+    )
+  ) %>%
+  ungroup()
+
 # Quick summary of significant hits per outcome + norm
 master_results %>%
   filter(qval_individual < 0.1) %>%
   count(outcome, norm, model) %>%
   print()
  
- 
+
+# ===========================================================================
+# 3.  BUILD MASTER DATAFRAME
+# ===========================================================================
+
+master_results <- bind_rows(all_results_list) %>%
+  select(outcome, norm, model, feature, metadata,
+         coef, stderr,
+         pval_individual, qval_individual,
+         pval_joint, qval_joint,
+         everything()) %>%
+  left_join(tax_lookup, by = "feature") %>%
+  group_by(tax_label) %>%
+  mutate(
+    tax_label_unique = ifelse(          # <-- base R ifelse(), not if_else()
+      n_distinct(feature) > 1,
+      paste0(tax_label, " (", feature, ")"),
+      tax_label
+    )
+  ) %>%
+  ungroup()
+
+# Quick summary of significant hits per outcome + norm
+cat("\nMaster results dimensions:", nrow(master_results), "rows x",
+    ncol(master_results), "cols\n")
+
+master_results %>%
+  filter(qval_individual < 0.1) %>%
+  count(outcome, norm, model) %>%
+  print()
+
+
+
+
 # ===========================================================================
 # 4.  CONCORDANCE TABLE (TSS vs CLR comparison per outcome)
 # ===========================================================================
@@ -286,7 +358,7 @@ make_volcano <- function(df,
                          title       = "Volcano Plot",
                          q_threshold = 0.1,
                          top_n_label = 15) {
- 
+
   df <- df %>%
     mutate(
       neg_log10_q = -log10(qval_individual + 1e-10),
@@ -300,23 +372,23 @@ make_volcano <- function(df,
                                     "Down (significant)",
                                     "Not significant"))
     )
- 
+
   top_hits <- df %>%
     filter(qval_individual < q_threshold) %>%
     arrange(qval_individual) %>%
     slice_head(n = top_n_label)
- 
+
   ggplot(df, aes(x = coef, y = neg_log10_q,
-                 color = direction, label = feature)) +
+                 color = direction, label = tax_label_unique)) +  # <-- tax_label here
     geom_point(alpha = 0.7, size = 2) +
     geom_hline(yintercept = -log10(q_threshold),
                linetype = "dashed", color = "grey40", linewidth = 0.5) +
     geom_vline(xintercept = 0,
                linetype = "solid", color = "grey70", linewidth = 0.4) +
-    geom_text_repel(data         = top_hits,
-                    size         = 2.8,
-                    max.overlaps = 20,
-                    box.padding  = 0.4,
+    geom_text_repel(data          = top_hits,
+                    size          = 2.8,
+                    max.overlaps  = 20,
+                    box.padding   = 0.4,
                     segment.color = "grey50") +
     scale_color_manual(
       values = c("Up (significant)"   = "#D73027",
