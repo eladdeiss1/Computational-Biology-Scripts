@@ -57,6 +57,7 @@ cat("Sequencing depth range:", range(meta$sequencing_depth), "\n")
 OUTCOME  <- "chronic_rhinitis36m"   # binary outcome of interest
 SITE     <- "canoe_site.x"      # covariate 1 (categorical)
 SEQDEPTH <- "sequencing_depth"        # covariate 2 (continuous, just added)
+SUBJECT_ID <- "Subject_ID"
  
 # Convert outcome to factor so MaAsLiN3 treats it as categorical
 meta[[OUTCOME]] <- factor(meta[[OUTCOME]])
@@ -69,7 +70,7 @@ meta <- data.frame(lapply(meta, function(x) {
 }), row.names = rownames(meta))
 
 # Double-check your key variables look right
-str(meta[, c(OUTCOME, SITE, SEQDEPTH)])
+str(meta[, c(OUTCOME, SITE, SEQDEPTH, SUBJECT_ID)])
 
 # ===========================================================================
 # 2.  RUN MaAsLiN3 — TSS + LOG (recommended default)
@@ -89,7 +90,8 @@ fit_TSS <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
   output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/",
-  formula        = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE),
+  formula = paste0("~ ", outcome_var, " + ", SEQDEPTH, " + ", SITE,
+                 " + (1|", SUBJECT_ID, ")"),
   normalization  = "TSS",
   transform      = "LOG",
   augment        = TRUE,
@@ -113,7 +115,8 @@ fit_CLR <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
   output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/maaslin3_output_CLR",
-  formula        = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE),
+  formula = paste0("~ ", outcome_var, " + ", SEQDEPTH, " + ", SITE,
+                 " + (1|", SUBJECT_ID, ")"),
   normalization  = "CLR",
   transform      = "NONE",    # <-- CRITICAL: do NOT use LOG with CLR
   augment        = TRUE,
