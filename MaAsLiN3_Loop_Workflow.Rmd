@@ -1,0 +1,353 @@
+---
+title: "MaAsLiN3 Loop Workflow"
+author: "Elad Deiss-Yehiely"
+date: "2026-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+###############################################################################
+#  MaAsLiN3 — Multi-Outcome Loop
+#  Loops over multiple primary outcomes, runs TSS and CLR for each,
+#  collects everything into one master dataframe, and saves to disk.
+###############################################################################
+ 
+ 
+# ===========================================================================
+# 0.  PACKAGES & SETUP
+# ===========================================================================
+ 
+library(maaslin3)
+library(phyloseq)
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+ 
+# Load your saved phyloseq object
+my_physeq <- readRDS("/Users/ediessy/Desktop/my_phyloseq.rds")
+ 
+# -- Extract feature table and metadata -------------------------------------
+feat_table <- as.data.frame(t(otu_table(my_physeq)))
+meta       <- as.data.frame(sample_data(my_physeq))
+ 
+# Force clean data.frame (fixes the xtfrm error)
+meta <- data.frame(lapply(meta, function(x) {
+  if (is.data.frame(x)) x[[1]] else x
+}), row.names = rownames(meta))
+ 
+# Add sequencing depth
+meta$sequencing_depth <- sample_sums(my_physeq)
+ 
+# -- Fixed covariates --------------------------------------------------------
+SITE     <- "site_of_collection"   # <-- update to match your column name
+SEQDEPTH <- "sequencing_depth"
+ 
+# -- Define all primary outcomes to loop over --------------------------------
+#    Update these to exactly match your metadata column names
+OUTCOMES <- c(
+  "chronic_rhinitis_12mo",
+  "chronic_rhinitis_24mo",
+  "chronic_rhinitis_36mo"
+  # add more here as needed, e.g.:
+  # "chronic_rhinitis_48mo",
+  # "wheeze_12mo",
+  # "atopy_36mo"
+)
+ 
+# -- Output root directory ---------------------------------------------------
+OUTPUT_DIR <- "/Users/ediessy/Desktop/Postdoc UCSF/CANOE"
+ 
+ 
+# ===========================================================================
+# 1.  HELPER FUNCTIONS
+# ===========================================================================
+ 
+# Prepare a single outcome column (factor, drop NAs)
+prepare_outcome <- function(meta, outcome_var) {
+  meta[[outcome_var]] <- factor(meta[[outcome_var]])
+  meta
+}
+ 
+# Run MaAsLiN3 for one outcome + normalization combo
+run_maaslin <- function(feat_table, meta, outcome_var,
+                        norm, transform, output_path,
+                        median_comp, warn_prev) {
+  maaslin3(
+    input_data                   = feat_table,
+    input_metadata               = meta,
+    output                       = output_path,
+    formula                      = paste0("~ ", outcome_var, " + ",
+                                          SEQDEPTH, " + ", SITE),
+    normalization                = norm,
+    transform                    = transform,
+    augment                      = TRUE,
+    standardize                  = TRUE,
+    max_significance             = 0.1,
+    median_comparison_abundance  = median_comp,
+    median_comparison_prevalence = FALSE,
+    warn_prevalence              = warn_prev,
+    save_models                  = FALSE
+  )
+}
+ 
+# Extract results for the outcome variable only, tag with metadata
+extract_results <- function(fit_out, outcome_var, norm_label) {
+  abund <- fit_out$fit_data_abundance$results %>%
+    filter(str_detect(metadata, fixed(outcome_var))) %>%
+    mutate(model = "Abundance", norm = norm_label, outcome = outcome_var)
+ 
+  prev <- fit_out$fit_data_prevalence$results %>%
+    filter(str_detect(metadata, fixed(outcome_var))) %>%
+    mutate(model = "Prevalence", norm = norm_label, outcome = outcome_var)
+ 
+  bind_rows(abund, prev)
+}
+ 
+ 
+# ===========================================================================
+# 2.  MAIN LOOP
+# ===========================================================================
+ 
+# Master results list — one entry per outcome per norm method
+all_results_list <- list()
+ 
+for (outcome in OUTCOMES) {
+ 
+  message("\n========================================")
+  message("Processing outcome: ", outcome)
+  message("========================================")
+ 
+  # Prepare metadata for this outcome (factor + drop NAs for this outcome)
+  meta_outcome <- prepare_outcome(meta, outcome)
+ 
+  # Remove samples with NA for this outcome
+  na_count <- sum(is.na(meta_outcome[[outcome]]))
+  if (na_count > 0) {
+    message("  Dropping ", na_count, " samples with NA for ", outcome)
+    keep <- !is.na(meta_outcome[[outcome]])
+    meta_outcome  <- meta_outcome[keep, , drop = FALSE]
+    feat_sub      <- feat_table[rownames(meta_outcome), , drop = FALSE]
+  } else {
+    feat_sub <- feat_table
+  }
+ 
+  # ---- TSS + LOG -----------------------------------------------------------
+  message("  Running TSS + LOG...")
+  tss_output <- file.path(OUTPUT_DIR, paste0("maaslin3_TSS_", outcome))
+ 
+  fit_TSS <- run_maaslin(
+    feat_table  = feat_sub,
+    meta        = meta_outcome,
+    outcome_var = outcome,
+    norm        = "TSS",
+    transform   = "LOG",
+    output_path = tss_output,
+    median_comp = TRUE,
+    warn_prev   = TRUE
+  )
+ 
+  res_TSS <- extract_results(fit_TSS, outcome, "TSS + LOG")
+ 
+  # ---- CLR -----------------------------------------------------------------
+  message("  Running CLR...")
+  clr_output <- file.path(OUTPUT_DIR, paste0("maaslin3_CLR_", outcome))
+ 
+  fit_CLR <- run_maaslin(
+    feat_table  = feat_sub,
+    meta        = meta_outcome,
+    outcome_var = outcome,
+    norm        = "CLR",
+    transform   = "NONE",
+    output_path = clr_output,
+    median_comp = FALSE,
+    warn_prev   = FALSE
+  )
+ 
+  res_CLR <- extract_results(fit_CLR, outcome, "CLR")
+ 
+  # ---- Combine and store ---------------------------------------------------
+  all_results_list[[outcome]] <- bind_rows(res_TSS, res_CLR)
+ 
+  message("  Done: ", nrow(res_TSS), " TSS rows, ", nrow(res_CLR), " CLR rows")
+}
+ 
+ 
+# ===========================================================================
+# 3.  BUILD MASTER DATAFRAME
+# ===========================================================================
+ 
+master_results <- bind_rows(all_results_list)
+ 
+# Reorder columns for readability
+master_results <- master_results %>%
+  select(outcome, norm, model, feature, metadata,
+         coef, stderr,
+         pval_individual, qval_individual,
+         pval_joint, qval_joint,
+         everything())
+ 
+cat("\nMaster results dimensions:", nrow(master_results), "rows x",
+    ncol(master_results), "cols\n")
+ 
+# Quick summary of significant hits per outcome + norm
+master_results %>%
+  filter(qval_individual < 0.1) %>%
+  count(outcome, norm, model) %>%
+  print()
+ 
+ 
+# ===========================================================================
+# 4.  CONCORDANCE TABLE (TSS vs CLR comparison per outcome)
+# ===========================================================================
+ 
+concordance_table <- master_results %>%
+  filter(model == "Abundance") %>%
+  select(outcome, norm, feature, coef, pval_individual, qval_individual) %>%
+  pivot_wider(
+    names_from  = norm,
+    values_from = c(coef, pval_individual, qval_individual),
+    names_sep   = "_"
+  ) %>%
+  rename(
+    coef_TSS  = `coef_TSS + LOG`,
+    coef_CLR  = coef_CLR,
+    pval_TSS  = `pval_individual_TSS + LOG`,
+    pval_CLR  = pval_individual_CLR,
+    qval_TSS  = `qval_individual_TSS + LOG`,
+    qval_CLR  = qval_individual_CLR
+  ) %>%
+  mutate(
+    concordant_direction = sign(coef_TSS) == sign(coef_CLR),
+    CLR_nominal_sig      = pval_CLR < 0.05,
+    confidence_tier      = case_when(
+      concordant_direction & CLR_nominal_sig  ~ "High",
+      concordant_direction & !CLR_nominal_sig ~ "Moderate",
+      !concordant_direction                   ~ "Low"
+    )
+  ) %>%
+  filter(qval_TSS < 0.1) %>%   # keep only TSS-significant hits
+  arrange(outcome, confidence_tier, qval_TSS)
+ 
+cat("\nConcordance table for TSS-significant hits:\n")
+print(concordance_table)
+ 
+ 
+# ===========================================================================
+# 5.  SAVE TO DISK
+# ===========================================================================
+ 
+save_path <- file.path(OUTPUT_DIR, "maaslin3_master_results")
+dir.create(save_path, showWarnings = FALSE)
+ 
+# Full master results (all outcomes, both norms, both models)
+write.csv(master_results,
+          file      = file.path(save_path, "master_results_all.csv"),
+          row.names = FALSE)
+ 
+# Significant hits only (qval_individual < 0.1)
+write.csv(master_results %>% filter(qval_individual < 0.1),
+          file      = file.path(save_path, "master_results_significant.csv"),
+          row.names = FALSE)
+ 
+# Concordance table
+write.csv(concordance_table,
+          file      = file.path(save_path, "concordance_TSS_vs_CLR.csv"),
+          row.names = FALSE)
+ 
+# R object (fastest to reload, preserves all data types)
+saveRDS(master_results,
+        file = file.path(save_path, "master_results.rds"))
+ 
+cat("\nAll files saved to:", save_path, "\n")
+ 
+ 
+# ===========================================================================
+# 6.  VOLCANO PLOTS — one per outcome, TSS abundance model
+#     (expand as needed for CLR / prevalence)
+# ===========================================================================
+ 
+make_volcano <- function(df,
+                         title       = "Volcano Plot",
+                         q_threshold = 0.1,
+                         top_n_label = 15) {
+ 
+  df <- df %>%
+    mutate(
+      neg_log10_q = -log10(qval_individual + 1e-10),
+      direction   = case_when(
+        qval_individual < q_threshold & coef > 0 ~ "Up (significant)",
+        qval_individual < q_threshold & coef < 0 ~ "Down (significant)",
+        TRUE                                      ~ "Not significant"
+      ),
+      direction = factor(direction,
+                         levels = c("Up (significant)",
+                                    "Down (significant)",
+                                    "Not significant"))
+    )
+ 
+  top_hits <- df %>%
+    filter(qval_individual < q_threshold) %>%
+    arrange(qval_individual) %>%
+    slice_head(n = top_n_label)
+ 
+  ggplot(df, aes(x = coef, y = neg_log10_q,
+                 color = direction, label = feature)) +
+    geom_point(alpha = 0.7, size = 2) +
+    geom_hline(yintercept = -log10(q_threshold),
+               linetype = "dashed", color = "grey40", linewidth = 0.5) +
+    geom_vline(xintercept = 0,
+               linetype = "solid", color = "grey70", linewidth = 0.4) +
+    geom_text_repel(data         = top_hits,
+                    size         = 2.8,
+                    max.overlaps = 20,
+                    box.padding  = 0.4,
+                    segment.color = "grey50") +
+    scale_color_manual(
+      values = c("Up (significant)"   = "#D73027",
+                 "Down (significant)" = "#4575B4",
+                 "Not significant"    = "grey70"),
+      name = NULL
+    ) +
+    labs(title   = title,
+         x       = "MaAsLiN3 coefficient (effect size)",
+         y       = expression(-log[10](q[individual])),
+         caption = paste0("q_individual < ", q_threshold, " (BH FDR)")) +
+    theme_bw(base_size = 12) +
+    theme(plot.title      = element_text(face = "bold", size = 13),
+          legend.position = "bottom")
+}
+ 
+# Generate and save one volcano per outcome (TSS abundance)
+for (outcome in OUTCOMES) {
+ 
+  plot_data <- master_results %>%
+    filter(outcome == !!outcome,
+           norm  == "TSS + LOG",
+           model == "Abundance")
+ 
+  if (nrow(plot_data) == 0) next
+ 
+  p <- make_volcano(plot_data,
+                    title = paste0("TSS + LOG | Abundance\n", outcome))
+ 
+  ggsave(
+    filename = file.path(save_path, paste0("volcano_TSS_", outcome, ".pdf")),
+    plot     = p,
+    width    = 8, height = 6
+  )
+}
+ 
+cat("Volcano plots saved.\n")
+ 
+ 
+###############################################################################
+# TO ADD NEW OUTCOMES LATER:
+#   Simply add the column name to the OUTCOMES vector at the top and re-run.
+#   New results will be appended to the master dataframe automatically.
+#
+# TO RELOAD SAVED RESULTS WITHOUT RE-RUNNING MAASLIN3:
+#   master_results <- readRDS(file.path(OUTPUT_DIR,
+#                             "maaslin3_master_results/master_results.rds"))
+###############################################################################
+```
+
