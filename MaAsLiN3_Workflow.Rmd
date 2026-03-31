@@ -14,6 +14,15 @@ library(ggrepel)
 library(patchwork)
 library(ggplot2)
 
+
+
+
+
+########### START FROM HERE AGAIN, CHECK WHERE THINGS SAVE AND RERUN NOW WITH RANDOM EFFECTS ########################
+
+
+
+
 # ===========================================================================
 # 1.  EXTRACT DATA FROM PHYLOSEQ
 # ===========================================================================
@@ -37,6 +46,12 @@ feat_table <- as.data.frame(otu_table(physeq))
 # -- Metadata ----------------------------------------------------------------
 meta <- as.data.frame(sample_data(physeq))
 meta <- as.data.frame(meta)
+meta <- data.frame(meta, stringsAsFactors = FALSE)
+meta <- meta %>%
+  mutate(across(all_of(OUTCOMES), 
+                ~factor(., levels = c(FALSE, TRUE), 
+                          labels = c("No", "Yes"))))
+ 
  
 
 # -- Add sequencing depth to metadata ----------------------------------------
@@ -90,7 +105,7 @@ fit_TSS <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
   output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/",
-  formula = paste0("~ ", outcome_var, " + ", SEQDEPTH, " + ", SITE,
+  formula = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
                  " + (1|", SUBJECT_ID, ")"),
   normalization  = "TSS",
   transform      = "LOG",
@@ -115,7 +130,7 @@ fit_CLR <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
   output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/maaslin3_output_CLR",
-  formula = paste0("~ ", outcome_var, " + ", SEQDEPTH, " + ", SITE,
+  formula = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
                  " + (1|", SUBJECT_ID, ")"),
   normalization  = "CLR",
   transform      = "NONE",    # <-- CRITICAL: do NOT use LOG with CLR
