@@ -15,205 +15,245 @@ library(patchwork)
 library(ggplot2)
 
 
-
-
-
-########### START FROM HERE AGAIN, CHECK WHERE THINGS SAVE AND RERUN NOW WITH RANDOM EFFECTS ########################
-
-
-
-
 # ===========================================================================
-# 1.  EXTRACT DATA FROM PHYLOSEQ
+# 1.  LOAD PHYLOSEQ & EXTRACT DATA
 # ===========================================================================
  
-# Replace `my_physeq` with the name of your actual phyloseq object
-physeq <- readRDS("/Users/ediessy/Desktop/phy_prev_10O_10R.rds")    # <-- change this
+physeq <- readRDS("/Users/ediessy/Desktop/phy_prev_10O_10R.rds")
  
-# -- ASV / feature table -----------------------------------------------------
-#    MaAsLiN3 wants: rows = samples, columns = ASVs (features)
-#    phyloseq stores OTU tables as features × samples or samples × features;
-#    otu_table() + as.data.frame() handles both orientations automatically.
- 
-#feat_table <- as.data.frame(
-#  t(otu_table(physeq))          # transpose so rows = samples (I believe mine are already row = samples)
-#)
- 
-# If otu_table is already samples × features, skip the t():
+# -- Feature table (rows = samples, columns = ASVs) --------------------------
 feat_table <- as.data.frame(otu_table(physeq))
- 
+cat("Feature table dimensions:", dim(feat_table), "\n")
+# Should be samples x ASVs (e.g. 883 x 118)
  
 # -- Metadata ----------------------------------------------------------------
-meta <- as.data.frame(sample_data(physeq))
-meta <- as.data.frame(meta)
-meta <- data.frame(meta, stringsAsFactors = FALSE)
-meta <- meta %>%
-  mutate(across(all_of(OUTCOMES), 
-                ~factor(., levels = c(FALSE, TRUE), 
-                          labels = c("No", "Yes"))))
+meta <- data.frame(sample_data(physeq), stringsAsFactors = FALSE)
  
- 
-
-# -- Add sequencing depth to metadata ----------------------------------------
-#    sample_sums() sums all reads (ASV counts) per sample.
-#    This is the standard way to retrieve library size from a phyloseq object.
+# -- Add sequencing depth ----------------------------------------------------
 meta$sequencing_depth <- sample_sums(physeq)
  
- 
-# -- Quick sanity checks -----------------------------------------------------
-stopifnot(all(rownames(feat_table) == rownames(meta)))   # samples must match
-cat("Samples:", nrow(meta), "\n")
-cat("ASVs   :", ncol(feat_table), "\n")
-cat("Sequencing depth range:", range(meta$sequencing_depth), "\n")
- 
- 
-# -- Rename columns to exactly what they are in YOUR metadata ----------------
-#    The variable names below must match your sample_data() column names.
-OUTCOME  <- "chronic_rhinitis36m"   # binary outcome of interest
-SITE     <- "canoe_site.x"      # covariate 1 (categorical)
-SEQDEPTH <- "sequencing_depth"        # covariate 2 (continuous, just added)
+# -- Define key variable names -----------------------------------------------
+OUTCOME    <- "chronic_rhinitis24m"
+SITE       <- "canoe_site.x"
+SEQDEPTH   <- "sequencing_depth"
 SUBJECT_ID <- "Subject_ID"
  
-# Convert outcome to factor so MaAsLiN3 treats it as categorical
-meta[[OUTCOME]] <- factor(meta[[OUTCOME]])
+# -- Convert logical outcome to proper factor ---------------------------------
+#    Check what it looks like before conversion
+cat("\nOutcome before conversion:\n")
+print(table(meta[[OUTCOME]], useNA = "always"))
  
-# Convert site to factor (if it isn't already)
-meta[[SITE]] <- factor(meta[[SITE]])
+meta[[OUTCOME]] <- factor(
+  meta[[OUTCOME]],
+  levels = c(FALSE, TRUE),
+  labels = c("No", "Yes")
+)
  
+#    Verify conversion worked
+cat("\nOutcome after conversion:\n")
+print(table(meta[[OUTCOME]], useNA = "always"))
+# Should show counts for No, Yes, and <NA>
+ 
+# -- Set reference level for site --------------------------------------------
+meta[[SITE]] <- factor(meta[[SITE]],
+                       levels = c("UWIM", "HFHS", "VAUN", "WUSL"))
+ 
+# -- Force clean data.frame --------------------------------------------------
 meta <- data.frame(lapply(meta, function(x) {
   if (is.data.frame(x)) x[[1]] else x
 }), row.names = rownames(meta))
-
-# Double-check your key variables look right
+ 
+# -- Sanity checks -----------------------------------------------------------
+stopifnot(all(rownames(feat_table) == rownames(meta)))
+cat("\nSamples:", nrow(meta), "\n")
+cat("ASVs   :", ncol(feat_table), "\n")
+cat("Sequencing depth range:", range(meta$sequencing_depth), "\n")
+cat("\nKey variable types:\n")
 str(meta[, c(OUTCOME, SITE, SEQDEPTH, SUBJECT_ID)])
-
+ 
+ 
 # ===========================================================================
-# 2.  RUN MaAsLiN3 — TSS + LOG (recommended default)
+# 2.  TAXONOMY LOOKUP
 # ===========================================================================
-#  Formula interpretation:
-#    ~ chronic_rhinitis_36mo + sequencing_depth + site_of_collection
-#    Tests the association of each ASV with the outcome while
-#    controlling for sequencing depth and site.
-#
-#  normalization = "TSS"  →  relative abundance (proportions)
-#  transform     = "LOG"  →  log2 of TSS-normalised proportions
-#  augment       = TRUE   →  avoids linear separability in logistic models
-#  standardize   = TRUE   →  z-scores continuous predictors for comparability
-#  median_comparison_abundance = TRUE  →  computational compositionality correction
+ 
+tax_lookup <- as.data.frame(tax_table(physeq)) %>%
+  rownames_to_column("feature") %>%
+  mutate(
+    tax_label = case_when(
+      !is.na(Genus)  & Genus  != "" ~ Genus,
+      !is.na(Family) & Family != "" ~ paste0(Family, " (Family)"),
+      !is.na(Order)  & Order  != "" ~ paste0(Order,  " (Order)"),
+      TRUE                          ~ feature
+    )
+  ) %>%
+  select(feature, Kingdom, Phylum, Class, Order, Family, Genus, tax_label)
+ 
+# Check taxonomy column names match yours
+cat("\nTaxonomy ranks available:", colnames(tax_table(physeq)), "\n")
+ 
+ 
+# ===========================================================================
+# 3.  RUN MaAsLiN3 — TSS + LOG
+# ===========================================================================
  
 fit_TSS <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
-  output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/",
-  formula = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
-                 " + (1|", SUBJECT_ID, ")"),
+  output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/MaAsLiN3 Loop/maaslin3_TSS_chronic_rhinitis24m",
+  formula        = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
+                          " + (1|", SUBJECT_ID, ")"),
   normalization  = "TSS",
   transform      = "LOG",
   augment        = TRUE,
   standardize    = TRUE,
-  max_significance          = 0.1,
+  max_significance             = 0.1,
   median_comparison_abundance  = TRUE,
   median_comparison_prevalence = FALSE,
   save_models    = FALSE
 )
  
-
+# -- Check what metadata values MaAsLiN3 actually produced ------------------
+cat("\nMetadata values in TSS abundance results:\n")
+print(unique(fit_TSS$fit_data_abundance$results$metadata))
+ 
+ 
 # ===========================================================================
-# 3.  RUN MaAsLiN3 — CLR + NONE
+# 4.  RUN MaAsLiN3 — CLR
 # ===========================================================================
-#  CLR (centred log-ratio) already incorporates a log transformation,
-#  so transform must be set to "NONE" to avoid double-transforming.
-#  Note: median_comparison_abundance is not needed / relevant with CLR
-#        because CLR handles compositionality differently.
  
 fit_CLR <- maaslin3(
   input_data     = feat_table,
   input_metadata = meta,
-  output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/maaslin3_output_CLR",
-  formula = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
-                 " + (1|", SUBJECT_ID, ")"),
+  output         = "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/MaAsLiN3 Loop/maaslin3_CLR_chronic_rhinitis24m",
+  formula        = paste0("~ ", OUTCOME, " + ", SEQDEPTH, " + ", SITE,
+                          " + (1|", SUBJECT_ID, ")"),
   normalization  = "CLR",
-  transform      = "NONE",    # <-- CRITICAL: do NOT use LOG with CLR
+  transform      = "NONE",
   augment        = TRUE,
   standardize    = TRUE,
-  max_significance          = 0.1,
+  max_significance             = 0.1,
   median_comparison_abundance  = FALSE,
   median_comparison_prevalence = FALSE,
-  warn_prevalence = FALSE,
+  warn_prevalence              = FALSE,
   save_models    = FALSE
 )
  
  
 # ===========================================================================
-# 4.  EXTRACT RESULTS FOCUSED ON THE PRIMARY OUTCOME
+# 5.  EXTRACT RESULTS
+#     We check what the metadata column actually looks like FIRST,
+#     then build the filter around that.
 # ===========================================================================
  
-# MaAsLiN3 returns separate results for abundance and prevalence models.
-# We filter to only rows where the metadata variable is our primary outcome.
+# -- Inspect the actual metadata string for our outcome ----------------------
+outcome_metadata_values <- fit_TSS$fit_data_abundance$results %>%
+  filter(str_detect(metadata, OUTCOME)) %>%
+  pull(metadata) %>%
+  unique()
  
-extract_outcome_results <- function(fit_out, outcome_var, norm_label) {
+cat("\nMetadata rows matching outcome variable:\n")
+print(outcome_metadata_values)
+# This tells us the exact string to filter on (e.g. "chronic_rhinitis24mYes")
  
-  # Abundance model results
+# -- Build filter string dynamically based on what MaAsLiN3 actually used ---
+#    If MaAsLiN3 appended "Yes" use that; if just the variable name, use that
+outcome_filter <- if (length(outcome_metadata_values) > 0) {
+  outcome_metadata_values  # use whatever MaAsLiN3 actually produced
+} else {
+  paste0(OUTCOME, "Yes")   # fallback
+}
+ 
+cat("\nWill filter on:", outcome_filter, "\n")
+ 
+# -- Extract function --------------------------------------------------------
+extract_outcome_results <- function(fit_out, outcome_filter, norm_label,
+                                    outcome_var) {
+ 
   abund <- fit_out$fit_data_abundance$results %>%
-    filter(str_detect(metadata, fixed(outcome_var))) %>%
-    mutate(model = "Abundance", norm = norm_label)
+    filter(metadata %in% outcome_filter) %>%
+    mutate(model = "Abundance", norm = norm_label, outcome = outcome_var)
  
-  # Prevalence model results
-  prev  <- fit_out$fit_data_prevalence$results %>%
-    filter(str_detect(metadata, fixed(outcome_var))) %>%
-    mutate(model = "Prevalence", norm = norm_label)
+  prev <- fit_out$fit_data_prevalence$results %>%
+    filter(metadata %in% outcome_filter) %>%
+    mutate(model = "Prevalence", norm = norm_label, outcome = outcome_var)
  
   bind_rows(abund, prev)
 }
  
-res_TSS <- extract_outcome_results(fit_TSS, OUTCOME, "TSS + LOG")
-res_CLR <- extract_outcome_results(fit_CLR, OUTCOME, "CLR")
+res_TSS <- extract_outcome_results(fit_TSS, outcome_filter, "TSS + LOG", OUTCOME)
+res_CLR <- extract_outcome_results(fit_CLR, outcome_filter, "CLR",       OUTCOME)
  
-# Combine into one data frame for comparative plotting
-res_all <- bind_rows(res_TSS, res_CLR)
+cat("\nRows extracted — TSS:", nrow(res_TSS), " CLR:", nrow(res_CLR), "\n")
  
-# Preview
-head(res_all)
-# Key columns:
-#   feature    = ASV identifier
-#   coef       = log-fold-change coefficient (effect size)
-#   stderr     = standard error of the coefficient
-#   pval       = raw p-value
-#   qval       = BH-corrected q-value (FDR)
-#   model      = "Abundance" or "Prevalence"
-#   norm       = "TSS + LOG" or "CLR"
- 
- 
-### Trying to think about why there are only TSS + LOG results for the res_all. ###
-# Find ASVs significant in TSS but check their direction in CLR
-res_TSS_sig <- res_TSS %>%
-  filter(model == "Abundance", qval_individual < 0.1)
+# -- Combine and add taxonomy ------------------------------------------------
+res_all <- bind_rows(res_TSS, res_CLR) %>%
+  left_join(tax_lookup, by = "feature")
 
-res_CLR_abund <- res_CLR %>%
-  filter(model == "Abundance") %>%
-  select(feature, coef_CLR = coef, pval_CLR = pval_individual, qval_CLR = qval_individual)
+# Step 1 — identify which tax_labels have multiple ASVs
+multi_asv_labels <- tax_lookup %>%
+  group_by(tax_label) %>%
+  filter(n_distinct(feature) > 1) %>%
+  pull(tax_label) %>%
+  unique()
 
-# Join and compare
-comparison <- res_TSS_sig %>%
-  left_join(res_CLR_abund, by = "feature") %>%
+# Step 2 — apply per-row unique label (no group_by needed)
+res_all <- res_all %>%
   mutate(
-    concordant_direction = sign(coef) == sign(coef_CLR),
-    CLR_nominal_sig      = pval_CLR < 0.05   # nominal, not FDR
+    tax_label_unique = ifelse(
+      tax_label %in% multi_asv_labels,
+      paste0(tax_label, " (", feature, ")"),
+      tax_label
+    )
   )
 
-print(comparison)
-
-
-
-
+cat("Total rows in res_all:", nrow(res_all), "\n")
+ 
+# -- Quick look at significant hits ------------------------------------------
+res_all %>%
+  filter(qval_individual < 0.1) %>%
+  select(norm, model, feature, tax_label, coef, qval_individual) %>%
+  arrange(norm, model, qval_individual) %>%
+  print(n = 30)
+ 
+ 
 # ===========================================================================
-# 5.  VOLCANO PLOT FUNCTION
+# 6.  CONCORDANCE TABLE (TSS vs CLR)
+# ===========================================================================
+ 
+concordance_table <- res_all %>%
+  filter(model == "Abundance") %>%
+  select(feature, tax_label, norm, coef, pval_individual, qval_individual) %>%
+  mutate(norm = recode(norm, "TSS + LOG" = "TSS")) %>%
+  pivot_wider(
+    names_from  = norm,
+    values_from = c(coef, pval_individual, qval_individual),
+    names_sep   = "_"
+  ) %>%
+  mutate(
+    concordant_direction = sign(coef_TSS) == sign(coef_CLR),
+    CLR_nominal_sig      = pval_individual_CLR < 0.05,
+    confidence_tier      = case_when(
+      concordant_direction & CLR_nominal_sig  ~ "High",
+      concordant_direction & !CLR_nominal_sig ~ "Moderate",
+      !concordant_direction                   ~ "Low"
+    )
+  ) %>%
+  filter(qval_individual_TSS < 0.1) %>%
+  arrange(confidence_tier, qval_individual_TSS)
+ 
+cat("\nConcordance table:\n")
+print(concordance_table)
+ 
+ 
+# ===========================================================================
+# 7.  VOLCANO PLOT FUNCTION
 # ===========================================================================
  
 make_volcano <- function(df,
                          title       = "Volcano Plot",
                          q_threshold = 0.1,
                          top_n_label = 15) {
+ 
   df <- df %>%
     mutate(
       neg_log10_q = -log10(qval_individual + 1e-10),
@@ -227,99 +267,95 @@ make_volcano <- function(df,
                                     "Down (significant)",
                                     "Not significant"))
     )
-
+ 
   top_hits <- df %>%
     filter(qval_individual < q_threshold) %>%
     arrange(qval_individual) %>%
     slice_head(n = top_n_label)
-
-  sig_line <- -log10(q_threshold)
-
+ 
   ggplot(df, aes(x = coef, y = neg_log10_q,
-                 color = direction, label = feature)) +
+                 color = direction, label = tax_label_unique)) +
     geom_point(alpha = 0.7, size = 2) +
-    geom_hline(yintercept = sig_line, linetype = "dashed",
-               color = "grey40", linewidth = 0.5) +
-    geom_vline(xintercept = 0, linetype = "solid",
-               color = "grey70", linewidth = 0.4) +
-    geom_text_repel(
-      data         = top_hits,
-      size         = 2.8,
-      max.overlaps = 20,
-      box.padding  = 0.4,
-      segment.color = "grey50"
-    ) +
+    geom_hline(yintercept = -log10(q_threshold),
+               linetype = "dashed", color = "grey40", linewidth = 0.5) +
+    geom_vline(xintercept = 0,
+               linetype = "solid", color = "grey70", linewidth = 0.4) +
+    geom_text_repel(data          = top_hits,
+                    size          = 2.8,
+                    max.overlaps  = 20,
+                    box.padding   = 0.4,
+                    segment.color = "grey50") +
     scale_color_manual(
       values = c("Up (significant)"   = "#D73027",
                  "Down (significant)" = "#4575B4",
                  "Not significant"    = "grey70"),
-      name   = NULL
+      name = NULL
     ) +
-    labs(
-      title   = title,
-      x       = "MaAsLiN3 coefficient (effect size)",
-      y       = expression(-log[10](q-value[individual])),
-      caption = paste0("Dashed line = q_individual < ", q_threshold, " (BH FDR)")
-    ) +
+    labs(title   = title,
+         x       = "MaAsLiN3 coefficient (effect size)",
+         y       = expression(-log[10](q[individual])),
+         caption = paste0("q_individual < ", q_threshold, " (BH FDR)")) +
     theme_bw(base_size = 12) +
-    theme(
-      plot.title      = element_text(face = "bold", size = 13),
-      legend.position = "bottom"
-    )
+    theme(plot.title      = element_text(face = "bold", size = 13),
+          legend.position = "bottom")
 }
  
  
 # ===========================================================================
-# 6.  BUILD AND SAVE VOLCANO PLOTS
+# 8.  BUILD & SAVE 2x2 COMPOSITE VOLCANO
 # ===========================================================================
  
-# ---- TSS + LOG: abundance --------------------------------------------------
-v_TSS_abund <- res_TSS %>%
-  filter(model == "Abundance") %>%
-  make_volcano(title = "TSS + LOG  |  Abundance model\nChronic Rhinitis at 36 months")
- 
-# ---- TSS + LOG: prevalence -------------------------------------------------
-v_TSS_prev <- res_TSS %>%
-  filter(model == "Prevalence") %>%
-  make_volcano(title = "TSS + LOG  |  Prevalence model\nChronic Rhinitis at 36 months")
- 
-# ---- CLR: abundance --------------------------------------------------------
-v_CLR_abund <- res_CLR %>%
-  filter(model == "Abundance") %>%
-  make_volcano(title = "CLR  |  Abundance model\nChronic Rhinitis at 36 months")
- 
-# ---- CLR: prevalence -------------------------------------------------------
-v_CLR_prev <- res_CLR %>%
-  filter(model == "Prevalence") %>%
-  make_volcano(title = "CLR  |  Prevalence model\nChronic Rhinitis at 36 months")
- 
- 
-# ---- 2 × 2 composite figure ------------------------------------------------
+v_TSS_abund <- res_all %>%
+  filter(norm == "TSS + LOG", model == "Abundance") %>%
+  make_volcano(title = "TSS + LOG  |  Abundance")
+
+v_TSS_prev <- res_all %>%
+  filter(norm == "TSS + LOG", model == "Prevalence") %>%
+  make_volcano(title = "TSS + LOG  |  Prevalence")
+
+v_CLR_abund <- res_all %>%
+  filter(norm == "CLR", model == "Abundance") %>%
+  make_volcano(title = "CLR  |  Abundance")
+
+v_CLR_prev <- res_all %>%
+  filter(norm == "CLR", model == "Prevalence") %>%
+  make_volcano(title = "CLR  |  Prevalence")
+
 composite_plot <- (v_TSS_abund | v_TSS_prev) /
-                  (v_CLR_abund  | v_CLR_prev)  +
+                  (v_CLR_abund  | v_CLR_prev) +
   plot_annotation(
-    title    = "Differential Abundance: Chronic Rhinitis at 36 Months",
-    subtitle = "MaAsLiN3 — comparing TSS+LOG vs CLR normalization",
-    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
-                     plot.subtitle = element_text(size = 11, color = "grey40"))
+    title    = "Chronic Rhinitis at 24 Months",
+    subtitle = "MaAsLiN3 — TSS+LOG vs CLR, Abundance vs Prevalence"
   )
- 
-# Save to file
-ggsave("maaslin3_volcano_composite.pdf",
-       plot   = composite_plot,
-       width  = 14, height = 11,
-       device = "pdf")
- 
-ggsave("maaslin3_volcano_composite.png",
-       plot  = composite_plot,
-       width = 14, height = 11,
-       dpi   = 300)
- 
-cat("Plots saved to working directory.\n")
- 
- 
+
+save_path <- "/Users/ediessy/Desktop"
+
+ggsave(
+  filename = file.path(save_path, "volcano_2x2_chronic_rhinitis24m_FIXED.pdf"),
+  plot     = composite_plot,
+  width    = 14, height = 11
+)
+
+cat("Plot saved!\n")
+
+
 # ===========================================================================
-# 7.  OPTIONAL — QUICK SUMMARY OF SIGNIFICANT HITS
+# 9.  SAVE RESULTS
+# ===========================================================================
+
+write.csv(res_all,
+          file      = file.path(save_path, "res_all_chronic_rhinitis24m.csv"),
+          row.names = FALSE)
+
+write.csv(concordance_table,
+          file      = file.path(save_path, "concordance_chronic_rhinitis24m.csv"),
+          row.names = FALSE)
+
+cat("Results saved!\n")
+
+
+# ===========================================================================
+# 10.  OPTIONAL — QUICK SUMMARY OF SIGNIFICANT HITS
 # ===========================================================================
  
 res_all %>%
@@ -353,8 +389,5 @@ res_all %>%
 #
 # max_significance: FDR (q-value) cutoff for "significant"     [default 0.1]
 ###############################################################################
-
-
-
 
 ```
