@@ -1,0 +1,983 @@
+---
+title: "Machine Learning"
+author: "Elad Deiss-Yehiely"
+date: "2026-04-01"
+output: html_document
+---
+
+
+
+
+######### EDY 4/1/26 HERE FOR TRYING TO IMPLEMENT SLIGHT FIXES OF FEATURE SELECTION FROM CLAUDE #########
+```{r}
+# Overview
+
+#This document trains a suite of machine learning classifiers to predict
+#chronic_rhinitis24m_current (binary: 0/1) using ASV relative abundances
+#as predictors. Models are evaluated by repeated k-fold cross-validation;
+#primary metric is **ROC AUC**.
+
+
+# 1. Libraries & Configuration
+library(tidyverse)
+library(phyloseq)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(pls)
+library(earth)
+library(gbm)
+library(ipred)
+library(pROC)       # for plotting ROC curves
+library(knitr)
+library(kableExtra)
+
+# ── USER CONFIGURATION ────────────────────────────────────────────────────────
+PHYLOSEQ_PATH  <- "/Users/ediessy/Desktop/phy_prev_10O_10R.rds"       # <-- update this path
+OUTCOME_COL    <- "chronic_rhinitis36m_current"
+SUBJECT_ID_COL <- "Subject_ID"
+POSITIVE_CLASS <- "Yes"                      # the level treated as the event
+                                             # change to "1" if stored as 0/1
+SEED           <- 481516
+RESULTS_DIR    <- "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/results_asv_ml"
+# ─────────────────────────────────────────────────────────────────────────────
+
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 2. Load & Prepare Data
+
+## 2.1 Load phyloseq and convert to relative abundance
+
+```{r load-data}
+ps <- readRDS(PHYLOSEQ_PATH)
+cat("Phyloseq object loaded:\n")
+print(ps)
+
+# Convert to relative abundance
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+cat("\nConverted to relative abundance.\n")
+```
+
+## 2.2 Extract ASV feature matrix
+
+```{r feature-matrix}
+# OTU table: samples as rows
+asv_mat <- as.data.frame(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) {
+  # already samples × ASVs — nothing to do
+} else {
+  asv_mat <- as.data.frame(t(asv_mat))
+}
+
+# Clean column names so caret doesn't choke on special characters
+colnames(asv_mat) <- make.names(colnames(asv_mat), unique = TRUE)
+
+cat(sprintf("ASV matrix: %d samples × %d ASVs\n", nrow(asv_mat), ncol(asv_mat)))
+```
+
+## 2.3 Extract outcome
+
+```{r extract-outcome}
+meta <- as.data.frame(sample_data(ps_rel))
+
+if (!OUTCOME_COL %in% colnames(meta)) {
+  stop(sprintf(
+    "Outcome column '%s' not found in sample_data. Available columns:\n%s",
+    OUTCOME_COL, paste(colnames(meta), collapse = ", ")
+  ))
+}
+
+outcome_raw <- as.character(meta[[OUTCOME_COL]])
+
+# Recode TRUE/FALSE → valid R names
+outcome_raw <- dplyr::recode(outcome_raw, "TRUE" = "Yes", "FALSE" = "No")
+
+# Coerce to factor with two levels; POSITIVE_CLASS will be the second level
+# so caret's twoClassSummary treats it as the event of interest
+outcome_factor <- factor(
+  outcome_raw,
+  levels = c("No", "Yes")
+)
+cat(sprintf("Outcome levels: %s  (positive class = '%s')\n",
+            paste(levels(outcome_factor), collapse = " / "), POSITIVE_CLASS))
+cat("Class distribution:\n")
+print(table(outcome_factor, useNA = "always"))
+```
+
+## 2.4 Align samples and create final X / y
+
+```{r align-samples}
+# Use only samples present in both the ASV matrix and the metadata
+shared_samples <- intersect(rownames(asv_mat), rownames(meta))
+cat(sprintf("Samples in ASV matrix: %d\n", nrow(asv_mat)))
+cat(sprintf("Samples in metadata:   %d\n", nrow(meta)))
+cat(sprintf("Shared samples:        %d\n", length(shared_samples)))
+
+X <- asv_mat[shared_samples, , drop = FALSE]
+y <- outcome_factor[match(shared_samples, rownames(meta))]
+
+# Drop samples with missing outcome
+complete_idx <- !is.na(y)
+X <- X[complete_idx, , drop = FALSE]
+y <- droplevels(y[complete_idx])
+
+cat(sprintf("\nFinal dataset after removing NA outcomes: %d samples × %d ASVs\n",
+            nrow(X), ncol(X)))
+cat("Final class distribution:\n")
+print(table(y))
+
+Xm <- as.matrix(X)   # numeric matrix for glmnet
+```
+
+---
+
+# 3. Cross-Validation Setup
+
+```{r train-control}
+n <- nrow(X)
+p <- ncol(X)
+
+# k: at least 5 samples per fold; cap at 10
+k       <- min(10, max(3, floor(n / 5)))
+repeats <- 5
+
+cat(sprintf("Cross-validation: %d-fold, %d repeats  (n = %d)\n", k, repeats, n))
+
+ctrl <- trainControl(
+  method           = "repeatedcv",
+  number           = k,
+  repeats          = repeats,
+  classProbs       = TRUE,           # required for ROC
+  summaryFunction  = twoClassSummary,
+  savePredictions  = "final",
+  returnResamp     = "all",
+  allowParallel    = TRUE,
+  verboseIter      = FALSE
+)
+
+# Primary optimisation metric
+METRIC <- "ROC"
+```
+
+> **Note on class imbalance:** If classes are severely imbalanced (< 20 % minority),
+> consider adding `sampling = "up"` (upsampling) or `sampling = "smote"` to
+> `trainControl()` above, and install the **DMwR2** package for SMOTE.
+
+---
+
+# 4. Train Models
+
+```{r train-models, results='hold'}
+set.seed(SEED)
+models     <- list()
+lambda_grid <- 10^seq(-4, 0, length.out = 20)
+
+safe_train <- function(label, expr) {
+  cat(sprintf("Training %s ...\n", label))
+  tryCatch({
+    m <- eval(expr)
+    best_roc <- max(m$results[[METRIC]], na.rm = TRUE)
+    cat(sprintf("  OK  best ROC AUC: %.4f\n", best_roc))
+    m
+  }, error = function(e) {
+    cat(sprintf("  FAIL: %s\n", e$message))
+    NULL
+  })
+}
+
+# ── 1. Ridge (alpha = 0, logistic via glmnet) ──────────────────────────────
+models$ridge <- safe_train("Ridge (glmnet, alpha=0)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha = 0, lambda = lambda_grid),
+        preProcess = c("center", "scale"), family = "binomial")
+))
+
+# ── 2. Lasso (alpha = 1) ───────────────────────────────────────────────────
+models$lasso <- safe_train("Lasso (glmnet, alpha=1)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha = 1, lambda = lambda_grid),
+        preProcess = c("center", "scale"), family = "binomial")
+))
+
+# ── 3. Elastic Net (alpha tuned) ───────────────────────────────────────────
+models$elastic_net <- safe_train("Elastic Net (glmnet, alpha tuned)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha = c(0.25, 0.5, 0.75), lambda = lambda_grid),
+        preProcess = c("center", "scale"), family = "binomial")
+))
+
+# ── 4. PLS-DA ──────────────────────────────────────────────────────────────
+max_comp <- min(15, p, n - 2)
+models$plsda <- safe_train("PLS-DA", quote(
+  train(x = Xm, y = y, method = "pls", metric = METRIC, trControl = ctrl,
+        tuneGrid   = data.frame(ncomp = 1:max_comp),
+        preProcess = c("center", "scale"))
+))
+
+# ── 5. MARS ────────────────────────────────────────────────────────────────
+models$mars <- safe_train("MARS (earth)", quote(
+  train(x = Xm, y = y, method = "earth", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(degree = 1:2, nprune = c(5, 10, 15, 20)),
+        preProcess = c("center", "scale"),
+        glm = list(family = binomial))   # logistic MARS
+))
+
+# ── 6. Random Forest ───────────────────────────────────────────────────────
+mtry_grid <- unique(c(2, floor(sqrt(p)), floor(p / 3), floor(p / 2)))
+mtry_grid <- sort(mtry_grid[mtry_grid >= 1 & mtry_grid <= p])
+models$random_forest <- safe_train("Random Forest", quote(
+  train(x = Xm, y = y, method = "rf", metric = METRIC, trControl = ctrl,
+        tuneGrid   = data.frame(mtry = mtry_grid),
+        ntree      = 500,
+        importance = TRUE)
+))
+
+# ── 7. Bagging (treebag) ───────────────────────────────────────────────────
+models$bagging <- safe_train("Bagging (treebag)", quote(
+  train(x = Xm, y = y, method = "treebag", metric = METRIC, trControl = ctrl,
+        nbagg = 100)
+))
+
+# ── 8. Gradient Boosting (GBM) ─────────────────────────────────────────────
+gbm_grid <- expand.grid(
+  n.trees           = c(100, 300, 500),
+  interaction.depth = c(1, 2, 3),
+  shrinkage         = c(0.01, 0.05, 0.1),
+  n.minobsinnode    = 5
+)
+models$gbm <- safe_train("Gradient Boosting (gbm)", quote(
+  train(x = Xm, y = y, method = "gbm", metric = METRIC, trControl = ctrl,
+        tuneGrid = gbm_grid, verbose = FALSE)
+))
+
+# Drop any models that failed to train
+models <- Filter(Negate(is.null), models)
+cat(sprintf("\nSuccessfully trained %d / 8 models\n", length(models)))
+```
+
+---
+
+# 5. Model Comparison
+
+## 5.1 CV performance summary table
+
+```{r performance-table}
+perf_list <- lapply(names(models), function(nm) {
+  r <- models[[nm]]$results
+  # Best row = row with highest ROC
+  best <- r[which.max(r$ROC), , drop = FALSE]
+  data.frame(
+    Model       = nm,
+    ROC_AUC     = round(best$ROC,  4),
+    Sensitivity = round(best$Sens, 4),
+    Specificity = round(best$Spec, 4),
+    ROC_SD      = round(best$ROCSD, 4)
+  )
+})
+
+perf_df <- do.call(rbind, perf_list) %>%
+  arrange(desc(ROC_AUC))
+
+perf_df %>%
+  kable(row.names = FALSE,
+        caption = "Cross-validated performance (best tuning per model)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(2, bold = TRUE, color = ifelse(perf_df$ROC_AUC == max(perf_df$ROC_AUC),
+                                              "green", "black"))
+
+# Save to disk
+write.csv(perf_df, file.path(RESULTS_DIR, "model_performance_summary.csv"),
+          row.names = FALSE)
+```
+
+## 5.2 Resampling distribution (dotplot)
+
+```{r resampling-dotplot, fig.height=5}
+resamp <- resamples(models)
+dotplot(resamp, metric = "ROC",
+        main = "ROC AUC — repeated CV distribution by model")
+```
+
+## 5.3 ROC curves (cross-validated predictions)
+
+```{r roc-curves, fig.height=6}
+roc_list <- lapply(names(models), function(nm) {
+  preds <- models[[nm]]$pred
+  if (is.null(preds)) return(NULL)
+  # Column name for positive class probability
+  pos_col <- POSITIVE_CLASS
+  if (!pos_col %in% colnames(preds)) return(NULL)
+  roc(preds$obs, preds[[pos_col]],
+      levels = rev(levels(preds$obs)),
+      quiet  = TRUE)
+})
+names(roc_list) <- names(models)
+roc_list <- Filter(Negate(is.null), roc_list)
+
+# Build colour palette
+cols <- scales::hue_pal()(length(roc_list))
+
+# Plot
+plot(roc_list[[1]], col = cols[1], lwd = 2,
+     main = "Cross-validated ROC curves — all models")
+for (i in seq_along(roc_list)[-1]) {
+  plot(roc_list[[i]], col = cols[i], lwd = 2, add = TRUE)
+}
+legend("bottomright",
+       legend = paste0(names(roc_list), " (AUC=",
+                       round(sapply(roc_list, auc), 3), ")"),
+       col    = cols, lwd = 2, cex = 0.75)
+```
+
+---
+
+# 6. Feature Importance
+
+```{r feature-importance, fig.height=8}
+TOP_N <- 20   # number of top ASVs to display per model
+
+extract_importance <- function(model_obj, model_name) {
+  tryCatch({
+    vi <- varImp(model_obj, scale = TRUE)$importance
+
+    # varImp returns different structures depending on model
+    if (ncol(vi) > 1) {
+      # Classification: average across classes or take the "Overall" / first col
+      if ("Overall" %in% colnames(vi)) {
+        vi <- vi[, "Overall", drop = FALSE]
+      } else {
+        vi$Overall <- rowMeans(vi)
+        vi <- vi[, "Overall", drop = FALSE]
+      }
+    }
+    colnames(vi) <- "Importance"
+    vi$Feature    <- rownames(vi)
+    vi$Model      <- model_name
+    vi <- vi[order(-vi$Importance), ]
+    head(vi, TOP_N)
+  }, error = function(e) {
+    message(sprintf("  Could not extract importance for %s: %s", model_name, e$message))
+    NULL
+  })
+}
+
+imp_list <- mapply(extract_importance, models, names(models),
+                   SIMPLIFY = FALSE)
+imp_all  <- do.call(rbind, Filter(Negate(is.null), imp_list))
+
+# Plot per model
+if (!is.null(imp_all) && nrow(imp_all) > 0) {
+  ggplot(imp_all, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_col(fill = "steelblue", alpha = 0.85) +
+    coord_flip() +
+    facet_wrap(~ Model, scales = "free_y") +
+    labs(title = sprintf("Top %d ASVs by variable importance — per model", TOP_N),
+         x = NULL, y = "Scaled importance") +
+    theme_bw(base_size = 9)
+
+  write.csv(imp_all, file.path(RESULTS_DIR, "feature_importance_all_models.csv"),
+            row.names = FALSE)
+} else {
+  cat("Feature importance could not be extracted for any model.\n")
+}
+```
+
+## 6.1 Consensus importance (ASVs ranked consistently across models)
+
+```{r consensus-importance, fig.height=5}
+# For each model, rank ASVs by importance (rank 1 = most important)
+# Consensus score = mean rank across models (lower = more consistently important)
+
+consensus <- imp_all %>%
+  group_by(Model) %>%
+  mutate(Rank = rank(-Importance, ties.method = "average")) %>%
+  ungroup() %>%
+  group_by(Feature) %>%
+  summarise(
+    Mean_Rank       = mean(Rank),
+    N_Models        = n(),
+    Mean_Importance = mean(Importance),
+    .groups = "drop"
+  ) %>%
+  filter(N_Models >= max(2, floor(length(models) / 2))) %>%  # in ≥ half the models
+  arrange(Mean_Rank) %>%
+  head(TOP_N)
+
+if (nrow(consensus) > 0) {
+  ggplot(consensus,
+         aes(x = reorder(Feature, -Mean_Rank), y = Mean_Importance)) +
+    geom_col(fill = "darkorange", alpha = 0.85) +
+    coord_flip() +
+    labs(title = sprintf("Consensus top ASVs (appearing in ≥ %d models)",
+                         max(2, floor(length(models) / 2))),
+         x = NULL, y = "Mean scaled importance") +
+    theme_bw()
+
+  write.csv(consensus, file.path(RESULTS_DIR, "consensus_feature_importance.csv"),
+            row.names = FALSE)
+} else {
+  cat("No ASVs appeared in enough models for a consensus ranking.\n")
+}
+```
+
+---
+
+# 7. Save Results
+
+```{r save-results}
+saveRDS(models,  file.path(RESULTS_DIR, "trained_models.rds"))
+saveRDS(resamp,  file.path(RESULTS_DIR, "resamples.rds"))
+
+cat("Saved to:", RESULTS_DIR, "\n")
+cat("  trained_models.rds\n")
+cat("  resamples.rds\n")
+cat("  model_performance_summary.csv\n")
+cat("  feature_importance_all_models.csv\n")
+cat("  consensus_feature_importance.csv\n")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######### ATTEMPT 2 #########
+
+
+
+
+---
+title: "ASV ML Classification: chronic_rhinitis24m_current"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+# Overview
+
+This document trains a suite of ML classifiers to predict
+**chronic_rhinitis24m_current** (binary: No/Yes) using ASV relative abundances
+as predictors.
+
+Key methodological choices:
+
+- **Grouped k-fold CV by Subject_ID** — all timepoints from the same subject
+  stay in the same fold, preventing data leakage across repeated measures.
+- **Upsampling** within each training fold to address class imbalance (~30% Yes).
+- **Near-zero variance filtering** (`nzv`) applied inside each fold.
+- Primary metric: **ROC AUC**.
+
+---
+
+# 1. Libraries & Configuration
+
+```{r libraries}
+if (!is.null(dev.list())) dev.off()
+gc()
+
+library(tidyverse)
+library(phyloseq)
+library(caret)
+library(glmnet)
+library(randomForest)
+library(pls)
+library(earth)
+library(gbm)
+library(ipred)
+library(pROC)
+library(knitr)
+library(kableExtra)
+
+# ── USER CONFIGURATION ────────────────────────────────────────────────────────
+PHYLOSEQ_PATH  <- "your_phyloseq.rds"   # <-- update this path
+OUTCOME_COL    <- "chronic_rhinitis24m_current"
+SUBJECT_ID_COL <- "Subject_ID"          # <-- update if your column name differs
+POSITIVE_CLASS <- "Yes"                 # positive event label after recoding
+SEED           <- 123
+CV_REPEATS     <- 5
+RESULTS_DIR    <- "results_asv_ml"
+# ─────────────────────────────────────────────────────────────────────────────
+
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+---
+
+# 2. Load & Prepare Data
+
+## 2.1 Load phyloseq and convert to relative abundance
+
+```{r load-data}
+ps <- readRDS(PHYLOSEQ_PATH)
+cat("Phyloseq object loaded:\n")
+print(ps)
+
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+cat("\nConverted to relative abundance.\n")
+```
+
+## 2.2 Extract ASV feature matrix
+
+```{r feature-matrix}
+asv_mat <- as.data.frame(otu_table(ps_rel))
+if (taxa_are_rows(ps_rel)) {
+  asv_mat <- as.data.frame(t(asv_mat))
+}
+
+# make.names() prevents caret errors from special characters in ASV IDs
+colnames(asv_mat) <- make.names(colnames(asv_mat), unique = TRUE)
+cat(sprintf("ASV matrix: %d samples x %d ASVs\n", nrow(asv_mat), ncol(asv_mat)))
+```
+
+## 2.3 Extract outcome and Subject ID
+
+```{r extract-outcome}
+meta <- as.data.frame(sample_data(ps_rel))
+
+# ── Outcome ──────────────────────────────────────────────────────────────────
+if (!OUTCOME_COL %in% colnames(meta)) {
+  stop(sprintf("Outcome column '%s' not found. Available columns:\n%s",
+               OUTCOME_COL, paste(colnames(meta), collapse = ", ")))
+}
+
+# as.character() handles logical TRUE/FALSE, numeric 0/1, or Yes/No uniformly
+outcome_raw <- as.character(meta[[OUTCOME_COL]])
+
+# Recode to valid R variable names.
+# TRUE/FALSE are reserved R keywords — caret throws an error if factor levels
+# match them. Mapping to Yes/No fixes this for all input formats.
+outcome_raw <- dplyr::recode(outcome_raw,
+                              "TRUE"  = "Yes",
+                              "FALSE" = "No",
+                              "1"     = "Yes",
+                              "0"     = "No")
+
+# Explicit level order: No first, Yes second.
+# twoClassSummary() treats the LAST level as the positive event.
+outcome_factor <- factor(outcome_raw, levels = c("No", "Yes"))
+
+cat("Class distribution:\n")
+print(table(outcome_factor, useNA = "always"))
+cat(sprintf("\nPositive class (Yes) prevalence: %.1f%%\n",
+            100 * mean(outcome_factor == "Yes", na.rm = TRUE)))
+
+# ── Subject ID ───────────────────────────────────────────────────────────────
+if (!SUBJECT_ID_COL %in% colnames(meta)) {
+  stop(sprintf("Subject ID column '%s' not found. Available columns:\n%s",
+               SUBJECT_ID_COL, paste(colnames(meta), collapse = ", ")))
+}
+subject_ids <- as.character(meta[[SUBJECT_ID_COL]])
+```
+
+## 2.4 Align samples and create final X / y / groups
+
+```{r align-samples}
+shared_samples <- intersect(rownames(asv_mat), rownames(meta))
+cat(sprintf("Samples in ASV matrix : %d\n", nrow(asv_mat)))
+cat(sprintf("Samples in metadata   : %d\n", nrow(meta)))
+cat(sprintf("Shared samples        : %d\n", length(shared_samples)))
+
+X           <- asv_mat[shared_samples, , drop = FALSE]
+y           <- outcome_factor[match(shared_samples, rownames(meta))]
+subject_vec <- subject_ids[match(shared_samples, rownames(meta))]
+
+# Remove rows with missing outcome
+complete_idx <- !is.na(y)
+X           <- X[complete_idx, , drop = FALSE]
+y           <- droplevels(y[complete_idx])
+subject_vec <- subject_vec[complete_idx]
+
+cat(sprintf("\nFinal dataset  : %d samples x %d ASVs\n", nrow(X), ncol(X)))
+cat(sprintf("Unique subjects: %d\n", length(unique(subject_vec))))
+cat("Final class distribution:\n")
+print(table(y))
+
+Xm <- as.matrix(X)
+n  <- nrow(X)
+p  <- ncol(X)
+```
+
+---
+
+# 3. Cross-Validation Setup
+
+```{r train-control}
+n_subjects <- length(unique(subject_vec))
+
+# k: hold out at least 5 subjects per fold; cap at 10
+k <- min(10, max(3, floor(n_subjects / 5)))
+cat(sprintf("Subjects: %d  =>  %d-fold grouped CV, %d repeats\n",
+            n_subjects, k, CV_REPEATS))
+
+# ── Build grouped fold indices ────────────────────────────────────────────────
+# groupKFold() ensures all rows from the same subject land in the same fold,
+# so the same subject is never split across train and test.
+#
+# We call it CV_REPEATS times with different seeds and concatenate the results.
+# Passing the full list as 'index' to trainControl with method = "cv" gives
+# repeated grouped CV: caret treats each element of 'index' as one CV
+# iteration, for a total of k * CV_REPEATS iterations.
+set.seed(SEED)
+fold_index <- unlist(
+  lapply(seq_len(CV_REPEATS), function(r) {
+    set.seed(SEED + r)
+    groupKFold(subject_vec, k = k)
+  }),
+  recursive = FALSE
+)
+
+# Unique names are required by caret
+names(fold_index) <- paste0(
+  "Fold", formatC(rep(seq_len(k), CV_REPEATS), width = 2, flag = "0"),
+  ".Rep", rep(seq_len(CV_REPEATS), each = k)
+)
+
+cat(sprintf("Total CV iterations: %d (%d folds x %d repeats)\n\n",
+            length(fold_index), k, CV_REPEATS))
+
+ctrl <- trainControl(
+  method          = "cv",        # 'cv' because we supply pre-built index
+  index           = fold_index,  # grouped repeated folds (no subject leakage)
+  classProbs      = TRUE,        # required for ROC
+  summaryFunction = twoClassSummary,
+  sampling        = "up",        # upsample minority class in TRAIN folds only;
+                                 # test fold class distribution is never altered
+  savePredictions = "final",
+  returnResamp    = "all",
+  allowParallel   = TRUE,
+  verboseIter     = FALSE
+)
+
+METRIC <- "ROC"
+```
+
+> **Why upsampling and not SMOTE?**
+> Upsampling randomly duplicates existing minority-class rows in the training
+> fold until classes are equal. SMOTE instead interpolates between real minority
+> samples to create synthetic ones. For relative abundance compositional data,
+> interpolation is biologically questionable — a synthetic microbiome profile
+> halfway between two real ones is not a meaningful observation. Upsampling is
+> the safer choice.
+>
+> **Why grouped folds?**
+> Each subject contributes up to three timepoints (0, 4, 12 months). Standard
+> CV would routinely put one timepoint in training and another in the test set
+> for the same subject, effectively letting the model "see" that subject during
+> training and inflating ROC estimates. Grouped folds prevent this entirely.
+
+---
+
+# 4. Train Models
+
+```{r train-models, results='hold'}
+set.seed(SEED)
+models      <- list()
+lambda_grid <- 10^seq(-4, 0, length.out = 20)
+
+safe_train <- function(label, expr) {
+  cat(sprintf("Training %s ...\n", label))
+  tryCatch({
+    m <- eval(expr)
+    cat(sprintf("  OK  best ROC AUC: %.4f\n",
+                max(m$results[[METRIC]], na.rm = TRUE)))
+    m
+  }, error = function(e) {
+    cat(sprintf("  FAIL: %s\n", e$message))
+    NULL
+  })
+}
+
+# nzv removes near-zero variance ASVs within each training fold before fitting
+PP <- c("nzv", "center", "scale")
+
+# ── 1. Ridge (alpha = 0) ─────────────────────────────────────────────────────
+models$ridge <- safe_train("Ridge (glmnet, alpha=0)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha = 0, lambda = lambda_grid),
+        preProcess = PP, family = "binomial")
+))
+
+# ── 2. Lasso (alpha = 1) ─────────────────────────────────────────────────────
+models$lasso <- safe_train("Lasso (glmnet, alpha=1)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha = 1, lambda = lambda_grid),
+        preProcess = PP, family = "binomial")
+))
+
+# ── 3. Elastic Net ───────────────────────────────────────────────────────────
+models$elastic_net <- safe_train("Elastic Net (glmnet, alpha tuned)", quote(
+  train(x = Xm, y = y, method = "glmnet", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(alpha  = c(0.25, 0.5, 0.75),
+                                 lambda = lambda_grid),
+        preProcess = PP, family = "binomial")
+))
+
+# ── 4. PLS-DA ────────────────────────────────────────────────────────────────
+max_comp <- min(15, p, n - 2)
+models$plsda <- safe_train("PLS-DA", quote(
+  train(x = Xm, y = y, method = "pls", metric = METRIC, trControl = ctrl,
+        tuneGrid   = data.frame(ncomp = 1:max_comp),
+        preProcess = PP)
+))
+
+# ── 5. MARS ──────────────────────────────────────────────────────────────────
+models$mars <- safe_train("MARS (earth)", quote(
+  train(x = Xm, y = y, method = "earth", metric = METRIC, trControl = ctrl,
+        tuneGrid   = expand.grid(degree = 1:2, nprune = c(5, 10, 15, 20)),
+        preProcess = PP,
+        glm        = list(family = binomial))
+))
+
+# ── 6. Random Forest ─────────────────────────────────────────────────────────
+mtry_grid <- sort(unique(c(2, floor(sqrt(p)), floor(p / 3), floor(p / 2))))
+mtry_grid <- mtry_grid[mtry_grid >= 1 & mtry_grid <= p]
+models$random_forest <- safe_train("Random Forest", quote(
+  train(x = Xm, y = y, method = "rf", metric = METRIC, trControl = ctrl,
+        tuneGrid   = data.frame(mtry = mtry_grid),
+        ntree      = 500,
+        importance = TRUE)
+))
+
+# ── 7. Bagging ───────────────────────────────────────────────────────────────
+models$bagging <- safe_train("Bagging (treebag)", quote(
+  train(x = Xm, y = y, method = "treebag", metric = METRIC, trControl = ctrl,
+        nbagg = 100)
+))
+
+# ── 8. Gradient Boosting ─────────────────────────────────────────────────────
+gbm_grid <- expand.grid(
+  n.trees           = c(100, 300, 500),
+  interaction.depth = c(1, 2, 3),
+  shrinkage         = c(0.01, 0.05, 0.1),
+  n.minobsinnode    = 5
+)
+models$gbm <- safe_train("Gradient Boosting (gbm)", quote(
+  train(x = Xm, y = y, method = "gbm", metric = METRIC, trControl = ctrl,
+        tuneGrid = gbm_grid, verbose = FALSE)
+))
+
+models <- Filter(Negate(is.null), models)
+cat(sprintf("\nSuccessfully trained %d / 8 models\n", length(models)))
+```
+
+---
+
+# 5. Model Comparison
+
+## 5.1 CV performance summary table
+
+```{r performance-table}
+perf_list <- lapply(names(models), function(nm) {
+  r    <- models[[nm]]$results
+  best <- r[which.max(r$ROC), , drop = FALSE]
+  data.frame(
+    Model       = nm,
+    ROC_AUC     = round(best$ROC,   4),
+    Sensitivity = round(best$Sens,  4),
+    Specificity = round(best$Spec,  4),
+    ROC_SD      = round(best$ROCSD, 4)
+  )
+})
+
+perf_df <- do.call(rbind, perf_list) %>% arrange(desc(ROC_AUC))
+
+perf_df %>%
+  kable(row.names = FALSE,
+        caption = "Cross-validated performance — best tuning per model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(2, bold = TRUE,
+              color = ifelse(perf_df$ROC_AUC == max(perf_df$ROC_AUC),
+                             "green", "black"))
+
+write.csv(perf_df,
+          file.path(RESULTS_DIR, "model_performance_summary.csv"),
+          row.names = FALSE)
+```
+
+## 5.2 Resampling distribution
+
+```{r resampling-dotplot, fig.height=5}
+resamp <- resamples(models)
+dotplot(resamp, metric = "ROC",
+        main = "ROC AUC — CV distribution by model")
+```
+
+## 5.3 ROC curves (cross-validated predictions)
+
+```{r roc-curves, fig.height=6}
+roc_list <- lapply(names(models), function(nm) {
+  preds <- models[[nm]]$pred
+  if (is.null(preds) || !POSITIVE_CLASS %in% colnames(preds)) return(NULL)
+  roc(preds$obs, preds[[POSITIVE_CLASS]],
+      levels = rev(levels(preds$obs)), quiet = TRUE)
+})
+names(roc_list) <- names(models)
+roc_list <- Filter(Negate(is.null), roc_list)
+
+cols <- scales::hue_pal()(length(roc_list))
+plot(roc_list[[1]], col = cols[1], lwd = 2,
+     main = "Cross-validated ROC curves — all models")
+for (i in seq_along(roc_list)[-1])
+  plot(roc_list[[i]], col = cols[i], lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = paste0(names(roc_list),
+                       " (AUC=", round(sapply(roc_list, auc), 3), ")"),
+       col = cols, lwd = 2, cex = 0.75)
+```
+
+---
+
+# 6. Feature Importance
+
+```{r feature-importance, fig.height=8}
+TOP_N <- 20
+
+extract_importance <- function(model_obj, model_name) {
+  tryCatch({
+    vi <- varImp(model_obj, scale = TRUE)$importance
+    if (ncol(vi) > 1) {
+      vi$Overall <- if ("Overall" %in% colnames(vi)) vi$Overall else rowMeans(vi)
+      vi <- vi[, "Overall", drop = FALSE]
+    }
+    colnames(vi) <- "Importance"
+    vi$Feature   <- rownames(vi)
+    vi$Model     <- model_name
+    head(vi[order(-vi$Importance), ], TOP_N)
+  }, error = function(e) {
+    message(sprintf("  Could not extract importance for %s: %s",
+                    model_name, e$message))
+    NULL
+  })
+}
+
+imp_all <- do.call(rbind,
+  Filter(Negate(is.null),
+         mapply(extract_importance, models, names(models), SIMPLIFY = FALSE)))
+
+if (!is.null(imp_all) && nrow(imp_all) > 0) {
+  print(
+    ggplot(imp_all, aes(x = reorder(Feature, Importance), y = Importance)) +
+      geom_col(fill = "steelblue", alpha = 0.85) +
+      coord_flip() +
+      facet_wrap(~ Model, scales = "free_y") +
+      labs(title = sprintf("Top %d ASVs by variable importance — per model", TOP_N),
+           x = NULL, y = "Scaled importance") +
+      theme_bw(base_size = 9)
+  )
+  write.csv(imp_all,
+            file.path(RESULTS_DIR, "feature_importance_all_models.csv"),
+            row.names = FALSE)
+}
+```
+
+## 6.1 Consensus importance
+
+ASVs are ranked within each model (rank 1 = most important), then the mean rank
+is computed across models. Only ASVs appearing in at least half the trained
+models are shown.
+
+```{r consensus-importance, fig.height=5}
+min_models <- max(2, floor(length(models) / 2))
+
+consensus <- imp_all %>%
+  group_by(Model) %>%
+  mutate(Rank = rank(-Importance, ties.method = "average")) %>%
+  ungroup() %>%
+  group_by(Feature) %>%
+  summarise(
+    Mean_Rank       = mean(Rank),
+    N_Models        = n(),
+    Mean_Importance = mean(Importance),
+    .groups = "drop"
+  ) %>%
+  filter(N_Models >= min_models) %>%
+  arrange(Mean_Rank) %>%
+  head(TOP_N)
+
+if (nrow(consensus) > 0) {
+  print(
+    ggplot(consensus,
+           aes(x = reorder(Feature, -Mean_Rank), y = Mean_Importance)) +
+      geom_col(fill = "darkorange", alpha = 0.85) +
+      coord_flip() +
+      labs(title = sprintf("Consensus top ASVs (appearing in >= %d / %d models)",
+                           min_models, length(models)),
+           x = NULL, y = "Mean scaled importance") +
+      theme_bw()
+  )
+  write.csv(consensus,
+            file.path(RESULTS_DIR, "consensus_feature_importance.csv"),
+            row.names = FALSE)
+} else {
+  cat("No ASVs appeared in enough models for a consensus ranking.\n")
+}
+```
+
+---
+
+# 7. Save Results
+
+```{r save-results}
+saveRDS(models, file.path(RESULTS_DIR, "trained_models.rds"))
+saveRDS(resamp, file.path(RESULTS_DIR, "resamples.rds"))
+
+cat("Saved to:", RESULTS_DIR, "\n")
+cat("  trained_models.rds\n")
+cat("  resamples.rds\n")
+cat("  model_performance_summary.csv\n")
+cat("  feature_importance_all_models.csv\n")
+cat("  consensus_feature_importance.csv\n")
+```
+
+---
+
+# 8. Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
