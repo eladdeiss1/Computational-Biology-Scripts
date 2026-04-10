@@ -1,0 +1,502 @@
+---
+title: "Alluvial Plot"
+author: "Elad Deiss-Yehiely"
+date: "2026-02-13"
+output: html_document
+---
+```{r}
+sam_complete <- sam_sub %>%
+  group_by(Subject_ID) %>%
+  filter(all(c(0, 4, 12) %in% Age)) %>%
+  ungroup()
+
+genus_levels <- c("Moraxella","Streptococcus","Staphylococcus",
+                  "Dolosigranulum","Corynebacterium","Haemophilus","Other")
+
+sam_wide <- sam_complete %>%
+  mutate(
+    Age = as.character(Age),
+    domgen_sum = factor(trimws(domgen_sum), levels = genus_levels)
+  ) %>%
+  select(Subject_ID, clust_sorensen_2, Age, domgen_sum) %>%
+  pivot_wider(names_from = Age, values_from = domgen_sum) %>%
+  rename(age0 = `0`, age4 = `4`, age12 = `12`) %>%
+  mutate(
+    age0  = factor(age0,  levels = genus_levels),
+    age4  = factor(age4,  levels = genus_levels),
+    age12 = factor(age12, levels = genus_levels)
+  )
+
+paths <- sam_wide %>%
+  count(clust_sorensen_2, age0, age4, age12, name = "n") %>%
+  group_by(clust_sorensen_2) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(alluvium = row_number())
+
+lodes <- ggalluvial::to_lodes_form(paths, axes = c("age0","age4","age12"), id = "alluvium")
+
+axis_col <- intersect(names(lodes), c("key","x","axis"))[1]
+
+# Go back to reversed factor levels
+lodes_fixed <- lodes %>%
+  rename(x_axis = all_of(axis_col)) %>%
+  mutate(
+    x_axis  = factor(as.character(x_axis), levels = c("age0","age4","age12")),
+    stratum = factor(as.character(stratum), levels = rev(genus_levels))  # Reversed!
+  ) %>%
+  group_by(clust_sorensen_2, x_axis) %>%
+  mutate(pct_recalc = n / sum(n)) %>%
+  ungroup()
+
+ggplot(
+  lodes_fixed,
+  aes(
+    x = x_axis,
+    stratum = stratum,
+    alluvium = alluvium,
+    y = pct_recalc,
+    fill = stratum
+  )
+) +
+  geom_flow(stat = "alluvium", alpha = 0.8, decreasing = TRUE) +
+  geom_stratum(decreasing = TRUE) +
+  facet_wrap(
+    ~ clust_sorensen_2,
+    nrow = 1,
+    labeller = labeller(clust_sorensen_2 = c(
+      "1-1" = "<span style='color:#006400;'>Trajectory 1</span>",
+      "1-2" = "<span style='color:#D41159;'>Trajectory 2</span>"
+    ))
+  ) +
+  scale_x_discrete(labels = c(age0 = "0", age4 = "4", age12 = "12")) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  scale_fill_discrete(limits = genus_levels, breaks = genus_levels, drop = FALSE) +
+  theme_minimal() +
+  labs(x = "Age (months)", y = "Percent within trajectory") +
+  theme(
+    legend.title = element_blank(),
+
+    # 🔹 Larger axis text
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text.x  = element_text(size = 15),
+    axis.text.y  = element_text(size = 15),
+
+    # 🔹 Enable colored facet labels
+    strip.text = ggtext::element_markdown(size = 18, face = "bold")
+  )
+
+```
+
+
+### Making a chi-squared table for chronic rhinitis and trajectory membership ###
+```{r}
+library(dplyr)
+
+make_participant_df <- function(df, outcome) {
+  df %>%
+    group_by(Subject_ID) %>%
+    #filter(all(c(0, 4, 12) %in% Age)) %>%          # keep complete trajectory (optional)
+    summarise(
+      clust_sorensen_2 = dplyr::first(clust_sorensen_2),
+      outcome_value    = dplyr::first(.data[[outcome]]),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(clust_sorensen_2), !is.na(outcome_value)) %>%
+    mutate(
+      clust_sorensen_2 = factor(clust_sorensen_2),
+      outcome_value    = factor(outcome_value)
+    )
+}
+
+chi_for_outcome <- function(df_long, outcome) {
+  d <- make_participant_df(df_long, outcome)
+  tab <- table(d$clust_sorensen_2, d$outcome_value)
+
+  # Use Fisher automatically if expected counts are small
+  chi <- suppressWarnings(chisq.test(tab))
+  use_fisher <- any(chi$expected < 5)
+
+  p <- if (use_fisher) fisher.test(tab)$p.value else chi$p.value
+
+  list(
+    outcome = outcome,
+    n = nrow(d),
+    table = tab,
+    test = if (use_fisher) "Fisher" else "Chi-squared",
+    p_value = p
+  )
+}
+
+outs <- c("chronic_rhinitis12m", "chronic_rhinitis24m_current", "chronic_rhinitis36m_current")
+
+res <- lapply(outs, \(o) chi_for_outcome(sam_sub_age4, o))
+
+summary_tbl <- data.frame(
+  outcome = sapply(res, `[[`, "outcome"),
+  n       = sapply(res, `[[`, "n"),
+  test    = sapply(res, `[[`, "test"),
+  p_value = sapply(res, `[[`, "p_value")
+) #%>%
+  #mutate(q_value = p.adjust(p_value, method = "fdr")
+         
+
+summary_tbl
+
+
+
+library(dplyr)
+library(stringr)
+library(knitr)
+library(kableExtra)
+
+# --- Make participant-level data (1 row per Subject_ID) ---
+make_participant_df <- function(df, outcome, require_ages = NULL) {
+  df2 <- df %>% mutate(Age = as.character(Age))
+
+  # Optional: require complete longitudinal ages (ONLY for full sam_sub, not sam_sub_age4)
+  if (!is.null(require_ages)) {
+    req <- as.character(require_ages)
+    df2 <- df2 %>%
+      group_by(Subject_ID) %>%
+      filter(all(req %in% Age)) %>%
+      ungroup()
+  }
+
+  df2 %>%
+    group_by(Subject_ID) %>%
+    summarise(
+      Trajectory = dplyr::first(clust_sorensen_2),
+      Outcome    = dplyr::first(.data[[outcome]]),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(Trajectory), !is.na(Outcome))
+}
+
+# --- Standardize outcome to Yes/No (robust to TRUE/FALSE, 0/1, "Yes"/"No") ---
+to_yes_no <- function(x) {
+  x_chr <- as.character(x)
+  x_chr <- trimws(tolower(x_chr))
+
+  yes_vals <- c("1","true","t","yes","y","case","positive")
+  no_vals  <- c("0","false","f","no","n","control","negative")
+
+  out <- ifelse(x_chr %in% yes_vals, "Yes",
+                ifelse(x_chr %in% no_vals, "No", NA_character_))
+  factor(out, levels = c("No","Yes"))
+}
+
+# --- Run test + return one row summary with counts embedded ---
+one_outcome_row <- function(df, outcome, require_ages = NULL) {
+  d <- make_participant_df(df, outcome, require_ages) %>%
+    mutate(
+      Trajectory = factor(Trajectory),
+      Outcome = to_yes_no(Outcome)
+    ) %>%
+    filter(!is.na(Outcome))
+
+  # Counts per trajectory
+  counts <- d %>%
+    count(Trajectory, Outcome) %>%
+    tidyr::complete(Trajectory, Outcome, fill = list(n = 0)) %>%
+    group_by(Trajectory) %>%
+    mutate(N_traj = sum(n)) %>%
+    ungroup()
+
+  # If any trajectory has 0 participants after filtering, flag it
+  if (nrow(counts) == 0 || any(counts$N_traj == 0)) {
+    return(tibble(
+      Outcome = outcome,
+      `N (T1)` = NA_integer_,
+      `Yes (T1)` = NA_character_,
+      `No (T1)`  = NA_character_,
+      `N (T2)` = NA_integer_,
+      `Yes (T2)` = NA_character_,
+      `No (T2)`  = NA_character_,
+      Test = NA_character_,
+      `p-value` = NA_real_,
+      Note = "No data after filtering"
+    ))
+  }
+
+  # Build 2x2 table
+  tab <- table(d$Trajectory, d$Outcome)
+
+  # Need at least 2 trajectory levels and 2 outcome levels
+  if (nrow(tab) < 2 || ncol(tab) < 2) {
+    # Still report counts
+    # Grab first two trajectory names if exist
+    trajs <- levels(d$Trajectory)
+    traj1 <- trajs[1]
+    traj2 <- ifelse(length(trajs) >= 2, trajs[2], NA)
+
+    fmt <- function(traj, val) {
+      n <- counts %>% filter(Trajectory == traj, Outcome == val) %>% pull(n)
+      N <- counts %>% filter(Trajectory == traj) %>% slice(1) %>% pull(N_traj)
+      paste0(n, " (", round(100 * n / N, 1), "%)")
+    }
+
+    return(tibble(
+      Outcome = outcome,
+      `N (T1)` = counts %>% filter(Trajectory == traj1) %>% slice(1) %>% pull(N_traj),
+      `Yes (T1)` = fmt(traj1, "Yes"),
+      `No (T1)`  = fmt(traj1, "No"),
+      `N (T2)` = if (!is.na(traj2)) counts %>% filter(Trajectory == traj2) %>% slice(1) %>% pull(N_traj) else NA_integer_,
+      `Yes (T2)` = if (!is.na(traj2)) fmt(traj2, "Yes") else NA_character_,
+      `No (T2)`  = if (!is.na(traj2)) fmt(traj2, "No")  else NA_character_,
+      Test = NA_character_,
+      `p-value` = NA_real_,
+      Note = "Not enough levels for a test"
+    ))
+  }
+
+  # Choose chi-square vs fisher
+  chi <- suppressWarnings(chisq.test(tab))
+  use_fisher <- any(chi$expected < 5)
+  p <- if (use_fisher) fisher.test(tab)$p.value else chi$p.value
+  test_name <- if (use_fisher) "Fisher" else "Chi-squared"
+
+  # Helper to format n (%)
+  fmt <- function(traj, val) {
+    n <- counts %>% filter(Trajectory == traj, Outcome == val) %>% pull(n)
+    N <- counts %>% filter(Trajectory == traj) %>% slice(1) %>% pull(N_traj)
+    paste0(n, " (", round(100 * n / N, 1), "%)")
+  }
+
+  trajs <- rownames(tab)
+  traj1 <- trajs[1]
+  traj2 <- trajs[2]
+
+  tibble(
+    Outcome = outcome,
+    `N (T1)` = counts %>% filter(Trajectory == traj1) %>% slice(1) %>% pull(N_traj),
+    `Yes (T1)` = fmt(traj1, "Yes"),
+    `No (T1)`  = fmt(traj1, "No"),
+    `N (T2)` = counts %>% filter(Trajectory == traj2) %>% slice(1) %>% pull(N_traj),
+    `Yes (T2)` = fmt(traj2, "Yes"),
+    `No (T2)`  = fmt(traj2, "No"),
+    Test = test_name,
+    `p-value` = p,
+    Note = NA_character_
+  )
+}
+
+# --- Main wrapper: produce kable ---
+make_chi_kable <- function(df, outcomes, require_ages = NULL,
+                           traj_labels = c("Trajectory 1", "Trajectory 2")) {
+
+  # Function to assign stars
+  p_stars <- function(p) {
+    if (is.na(p)) return(NA)
+    if (p <= 0.001) return("***")
+    if (p <= 0.01)  return("**")
+    if (p <= 0.05)  return("*")
+    return("")
+  }
+
+  out_tbl <- dplyr::bind_rows(
+    lapply(outcomes, \(o) one_outcome_row(df, o, require_ages))
+  )
+
+  out_tbl <- out_tbl %>%
+    mutate(
+      Outcome = Outcome %>%
+        stringr::str_remove("_current$") %>%
+        stringr::str_replace_all("_", " ") %>%
+        stringr::str_replace_all("\\b(\\d+)m\\b", "\\1 mo") %>%
+        stringr::str_to_title(),
+
+      p_formatted = ifelse(
+        is.na(`p-value`),
+        NA,
+        {
+          stars <- sapply(`p-value`, p_stars)
+          p_val <- signif(`p-value`, 3)
+          formatted <- paste0(p_val, stars)
+          ifelse(`p-value` < 0.05,
+                 paste0("<b>", formatted, "</b>"),
+                 formatted)
+        }
+      )
+    )
+
+  out_tbl_clean <- out_tbl %>%
+    transmute(
+      Outcome,
+      `T1_Yes` = `Yes (T1)`,
+      `T1_No`  = `No (T1)`,
+      `T2_Yes` = `Yes (T2)`,
+      `T2_No`  = `No (T2)`,
+      `p-value` = p_formatted
+    )
+
+  # Create colored header labels (HTML styling)
+  header_labels <- c(
+    "Outcome",
+    paste0("<span style='color:#006400;'>", traj_labels[1], "</span> (Yes)"),
+    paste0("<span style='color:#006400;'>", traj_labels[1], "</span> (No)"),
+    paste0("<span style='color:#D41159;'>", traj_labels[2], "</span> (Yes)"),
+    paste0("<span style='color:#D41159;'>", traj_labels[2], "</span> (No)"),
+    "p-value"
+  )
+
+  colnames(out_tbl_clean) <- header_labels
+
+  out_tbl_clean %>%
+    knitr::kable(format = "html", escape = FALSE, align = "lccccc") %>%
+    kableExtra::kable_styling(
+      full_width = FALSE,
+      bootstrap_options = c("striped", "condensed")
+    ) %>%
+    kableExtra::row_spec(0, bold = TRUE)
+}
+
+
+
+make_chi_kable(
+  df = sam_sub_age4,
+  outcomes = outs,
+  require_ages = NULL,
+  traj_labels = c("1-1" = "Trajectory 1", "1-2" = "Trajectory 2")
+)
+
+
+
+library(webshot2)
+library(htmltools)
+library(kableExtra)
+
+# 1️⃣ Create base table object
+tbl <- make_chi_kable(
+  df = sam_sub,
+  outcomes = outs,
+  require_ages = NULL,
+  traj_labels = c("1-1" = "Trajectory 1",
+                  "1-2" = "Trajectory 2")
+)
+
+# 2️⃣ Apply styling (IMPORTANT: save this object)
+tbl_styled <- tbl %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "condensed"),
+    font_size = 22   # Increase for larger font (20–26 good range)
+  ) %>%
+  kableExtra::row_spec(0, bold = TRUE)
+
+# 3️⃣ Save as HTML
+htmltools::save_html(
+  htmltools::tagList(tbl_styled),
+  "~/Desktop/chi_trajectory_table.html"
+)
+
+# 4️⃣ Save as high-resolution PNG
+webshot2::webshot(
+  "~/Desktop/chi_trajectory_table.html",
+  file = "~/Desktop/chi_trajectory_table.png",
+  vwidth = 1600,
+  vheight = 600,
+  zoom = 2.5   # Increase for very crisp output
+)
+
+# Save as HTML first
+kableExtra::save_kable(tbl, file = "chi_trajectory_table.html")
+
+# Then save as an image (PNG) or PDF
+kableExtra::save_kable(tbl, file = "chi_trajectory_table.png")
+#kableExtra::save_kable(tbl, file = "chi_trajectory_table.pdf")
+
+
+
+
+
+
+
+
+library(webshot2)
+library(htmltools)
+library(kableExtra)
+
+# Build the table (this should already return an HTML table / kable object)
+tbl <- make_chi_kable(
+  df = sam_sub,
+  outcomes = outs,
+  require_ages = NULL,
+  traj_labels = c("1-1" = "Trajectory 1",
+                  "1-2" = "Trajectory 2")
+)
+
+# If you want additional styling, do it here (optional)
+tbl_styled <- tbl %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "condensed"),
+    font_size = 22
+  ) %>%
+  kableExtra::row_spec(0, bold = TRUE)
+
+# ✅ IMPORTANT: wrap in HTML() so tags are not escaped
+page <- htmltools::tags$html(
+  htmltools::tags<head>(
+    htmltools::tags$meta(charset = "utf-8")
+  ),
+  htmltools::tags$body(
+    htmltools::HTML(as.character(tbl_styled))
+  )
+)
+
+html_file <- "~/Desktop/chi_trajectory_table.html"
+png_file  <- "~/Desktop/chi_trajectory_table.png"
+
+htmltools::save_html(page, file = html_file)
+
+webshot2::webshot(
+  html_file,
+  file = png_file,
+  vwidth = 1600,
+  vheight = 600,
+  zoom = 2.5
+)
+
+
+
+
+
+
+
+
+library(webshot2)
+library(kableExtra)
+
+# Create table
+tbl <- make_chi_kable(
+  df = sam_sub,
+  outcomes = outs,
+  require_ages = NULL,
+  traj_labels = c("1-1" = "Trajectory 1",
+                  "1-2" = "Trajectory 2")
+)
+
+# Style it
+tbl_styled <- tbl %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "condensed"),
+    font_size = 22
+  ) %>%
+  kableExtra::row_spec(0, bold = TRUE)
+
+# Save directly as PNG (no intermediate HTML needed)
+kableExtra::save_kable(
+  tbl_styled,
+  file = "~/Desktop/chi_trajectory_table.png",
+  zoom = 2.5
+)
+
+```
+
