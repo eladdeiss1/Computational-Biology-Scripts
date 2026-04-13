@@ -1,0 +1,1856 @@
+---
+title: "CANOE LCGA TEST code analysis"
+author: Kameron Sugino
+date: "Feb 24 2025"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+require(reshape2)
+require(vegan)
+require(phyloseq)
+require(MASS)
+require(ggplot2)
+require(ggalluvial)
+require(dplyr)
+library(flexmix)
+library(gridExtra)
+require(kableExtra)
+require(table1)
+require(tidyr)
+
+# set wd
+knitr::opts_knit$set(root.dir = '/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree')
+
+# read in phy obj
+phy<-readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/CANOE_3Runs_merged_phy_pretree.rds")
+
+# reorder age variable
+sample_data(phy_subset_samplesOnly)$Group<-factor(sample_data(phy_subset_samplesOnly)$Group, levels=c("child - newborn","child - 4 months","child - 12 months"))
+
+# read in beta div code
+source("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/20250103_beta_div_calc_stats_plots.R")
+
+```
+
+#From samples that Cindy sent, need to think about HW/HA and LW/LA for further isolation
+```{r}
+phy_LAMB<-readRDS("~/Downloads/20250610_lamb_phy_rare_rep_only_FINAL.rds")
+adsl <- read.csv("~/Downloads/adsl.sas7bdat.csv", stringsAsFactors = FALSE)
+
+phenos <- adsl %>%
+  select(
+    SUBJID,
+    PHENO_Y7, PHENO10,
+    ASTHMA7, ASTHMA10,
+    AAERO7, AAERO10
+  ) %>%
+  distinct(SUBJID, .keep_all = TRUE)
+
+phenos <- phenos %>%
+  mutate(
+    LWLA_Y7_Y10 = ifelse(
+      PHENO_Y7 == "LW-LA" & PHENO10 == "LW-LA",
+      1,
+      0
+    )
+  )
+
+box_values <- read.csv("~/Downloads/Moraxella_BoxContents (1).csv", row.names = NULL)
+
+ids_box <- unique(box_values$Participant_ID)
+
+ids_phenos <- phenos %>%
+  dplyr::filter(LWLA_Y7_Y10 == 1) %>%
+  dplyr::pull(SUBJID) %>%
+  unique()
+
+matched_ids_low <- intersect(ids_box, ids_phenos)
+
+matched_df_low <- phenos %>%
+  dplyr::filter(
+    LWLA_Y7_Y10 == 1,
+    SUBJID %in% matched_ids_low
+  )
+
+```
+
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+# test<-data.frame(t(phy@otu_table))
+# otu_table(phy)<-otu_table(test,taxa_are_rows = F)
+
+###Only need this once, as I hard-code fixed this before making merged_df in the metadata merging.
+# Extract sample data as data.frame
+sample_df <- as.data.frame(sample_data(phy_log_tss))
+
+# Assign "child - 4 months" to sample IDs, and make it a factor
+sample_df[c("UWIM100996", "UWIM101285", "UWIM101330", "UWIM101454", "UWIM101553", "UWIM101637", "UWIM101648", "UWIM101778", "UWIM101825", "UWIM101853", "UWIM101910", "UWIM100795"), "Group"] <- "child - 4 months"
+sample_df$Group <- factor(sample_df$Group)
+
+# Put the updated data back into your phyloseq object
+sample_data(phy_subset_samplesOnly) <- sample_df
+
+
+# # step 1: calculate PCoA ordination
+my_dists <- c("bray", "sorensen", "canberra")
+temp_beta<-beta_div_calc(phy_tss, dists = my_dists)
+# # step 2: run PERMANOVA models
+test_stats<-beta_div_stats(phy_tss, model_vars=c("Group"), subjectid = "Subject_ID", dists = my_dists)
+
+# # step 3: combine into one output and save
+# phy_beta_stats<-list(temp_beta, test_stats)
+# saveRDS(phy_beta_stats,"/Users/ksugino/Downloads/CANOE_Airway_LCGA_20250224.rds")
+
+#phy_stats<-readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/CANOE_Airway_LCGA_20250224.rds")
+#temp_beta<-phy_stats[[1]]
+#test_stats<-phy_stats[[2]]
+
+#pl<-beta_div_plots(phy = phy_subset_samplesOnly, beta_div = temp_beta, group = "Group", dists = my_dists, pval_picker = 1)
+#pl
+
+# append bray-curtis coordinates to sam
+sam<-as.data.frame(sample_data(phy_tss))
+sam$Axis1_bc<-temp_beta[["bray"]]$vectors[,c(1)]
+sam$Axis2_bc<-temp_beta[["bray"]]$vectors[,c(2)]
+sam$Axis1_sorensen<-temp_beta[["sorensen"]][["points"]][,1]
+sam$Axis2_sorensen<-temp_beta[["sorensen"]][["points"]][,2]
+
+sam$age<-factor(sam$Group,labels=c(0,4,12))
+sam$age<-as.numeric(as.character(sam$age))
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+# bray PC1
+# subset to complete data
+set.seed(31415)
+sam_sub<-data.frame(sam[!is.na(sam$Axis1_bc),])
+sam_sub<-data.frame(sam[!is.na(sam$Subject_ID)])
+sam_sub$Subject_ID <- as.factor(sam_sub$Subject_ID)
+# # estimate lcga models with 1-3 classes:
+ lcgaMix <- stepFlexmix(Axis1_bc ~ age | Subject_ID, k = 1:5, nrep = 100, 
+                        model= FLXMRglmfix(Axis1_bc ~ age, varFix=TRUE), 
+                        data = sam_sub, 
+                        control = list(iter.max = 500, minprior = 0))
+
+  lcgaMix_bc2 <- stepFlexmix(Axis2_bc ~ age | Subject_ID, k = 1:5, nrep = 100, 
+                        model= FLXMRglmfix(Axis2_bc ~ age, varFix=TRUE), 
+                        data = sam_sub, 
+                        control = list(iter.max = 500, minprior = 0))
+ # # save model
+# saveRDS(lcgaMix,"/Users/ksugino/Downloads/CANOE_Airway_LCGA_bcaxis1.rds")
+
+# inspect and compare model-fit results:
+lcgaMix<-readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/CANOE_Airway_LCGA_bcaxis1.rds")
+
+# iter converged k k0    logLik      AIC      BIC      ICL
+# 1    2      TRUE 1  1 -88.76638 183.5328 196.9359 196.9359
+# 2   17      TRUE 2  2 -49.63565 111.2713 138.0775 184.4195 <-best
+# 3   23      TRUE 3  3 -49.63461 117.2692 157.4785 351.0207
+# 4   62      TRUE 4  4 -49.63382 123.2676 176.8800 443.1325
+# 5   56      TRUE 5  5 -49.63348 129.2670 196.2824 589.5278
+
+# find lowest BIC, pull out best model
+low<-which(BIC(lcgaMix)==min(BIC(lcgaMix)))
+bc1<-lcgaMix@models[[low]]@cluster
+
+#Third<-which(BIC(lcgaMix)==min(BIC(lcgaMix)))
+bc1_3Group<-lcgaMix@models[[3]]@cluster
+
+bc1_4Group<-lcgaMix@models[[4]]@cluster
+
+ggplot(sam_sub, aes(y=Axis1_bc, x=Age, color=factor(bc_pc1), group=bc_pc1))+
+  geom_point()+
+  geom_path(aes(group=Subject_ID))+
+  stat_summary(aes(y=Axis1_bc, x=Age,
+                   group=factor(bc_pc1))
+               #, color="black",geom = "line", 
+               #fun = mean, size=5,inherit.aes = F
+               )+
+  stat_summary(geom = "line", fun = mean, size=4, inherit.aes = T)
+
+sam_sub$Age <- as.factor(sam_sub$Age)
+ggplot(sam_sub, aes(y=Axis1_bc, x=Age, color=factor(clust), group=clust))+
+  geom_point()+
+  geom_path(aes(group=Subject_ID))+
+  stat_summary(aes(y=Axis1_bc, x=Group,
+                   group=factor(clust))
+               #, color="black",geom = "line", 
+               #fun = mean, size=5,inherit.aes = F
+               )+
+  stat_summary(geom = "line", fun = mean, size=4, inherit.aes = T)
+
+###THIS ONE###
+ggplot(sam_sub, aes(y = Axis1_bc, x = Age, group = Subject_ID, color = factor(clust))) +
+  geom_point() +
+  geom_path() +
+
+  # Summary line for clust == "1-1"
+  stat_summary(
+    data = subset(sam_sub, clust == "1-1"),
+    aes(group = clust),
+    geom = "line",
+    fun = mean,
+    size = 4
+  ) +
+
+  # Summary line for clust == "2-1"
+  stat_summary(
+    data = subset(sam_sub, clust == "2-1"),
+    aes(group = clust),
+    geom = "line",
+    fun = mean,
+    size = 4
+  ) +
+  
+  # Summary line for clust == "3-1"
+  stat_summary(
+    data = subset(sam_sub, clust == "3-1"),
+    aes(group = clust),
+    geom = "line",
+    fun = mean,
+    size = 4
+  ) +
+  # Manual color mapping for both lines and points
+  scale_color_manual(
+    values = c(
+      "2-1" = "#57cae3",
+      "1-1" = "#3884ec",
+      "3-1" = "#c638ec" 
+    )
+  )
+
+
+###EDY from here###
+summary(lcgaMix@models[[3]])  # Access the fit summary for k = 3 groups
+
+ggplot(sam_sub, aes(y=Axis1_bc, x=Group, color=factor(bc1_3Group), group=bc1_3Group))+
+  geom_point()+
+  geom_path(aes(group=Subject_ID))+
+  stat_summary(aes(y=Axis1_bc, x=Group,
+                   group=factor(bc1)),
+               #color="black",geom = "line", 
+               fun = mean, size=0.5,inherit.aes = F)+
+  stat_summary(geom = "line", fun = mean, size=4, inherit.aes = T) +
+  theme(legend.position = "none")
+
+#create 3 cluster model df
+sam_sub_3_ind<-sam_sub
+sam_sub_3_ind$bc_clust<-lcgaMix@models[[3]]@cluster
+
+# ggplot(sam_sub, aes(y=Axis1_bc, x=Group, color=factor(bc1_3Group), group=bc1_3Group)) +
+#   geom_point() +
+#   geom_path(aes(group=Subject_ID)) +
+#   stat_summary(aes(y=Axis1_bc, x=Group, group=factor(bc1)),
+#                geom = "line",  # Ensure it only draws lines
+#                fun = mean, 
+#                size=4,  # Adjust size to make sure it's not causing large points
+#                inherit.aes = FALSE) +
+#   stat_summary(geom = "line", fun = mean, size=1, inherit.aes = TRUE)
+
+
+### Looking into membership of each GMM group to see if there are samples that are close to either 2/3.
+# Extract the scaled matrix
+scaled_matrix <- lcgaMix@models[["3"]]@posterior[["scaled"]]
+
+# Create an empty matrix of the same dimensions with 0s
+membership_matrix <- matrix(0, nrow = nrow(scaled_matrix), ncol = ncol(scaled_matrix))
+
+# For each row, find the index of the max value and assign that value to the correct position in membership_matrix
+for (i in 1:nrow(scaled_matrix)) {
+  max_col <- which.max(scaled_matrix[i, ])
+  membership_matrix[i, max_col] <- scaled_matrix[i, max_col]
+}
+
+# Convert the matrix to a dataframe and name the columns as "1", "2", and "3"
+membership_values <- as.data.frame(membership_matrix)
+colnames(membership_values) <- c("1", "2", "3")
+
+# View the resulting dataframe
+head(membership_values)
+
+# Add column 2170 from sam_sub to membership_values
+membership_values$Age <- sam_sub[[2170]]
+
+membership_values_12months <- membership_values %>% filter(Age==12)
+
+
+library(tidyverse)
+
+# Assuming membership_values exists as a data frame with columns "1", "2", and "3"
+# Reshape to long format
+membership_long_12months <- membership_values_12months %>%
+  rowid_to_column("Row") %>%  # gives each row a unique ID
+  pivot_longer(cols = c("1", "2", "3"), names_to = "Group", values_to = "Value") %>%
+  filter(Value != 0)
+
+# Create scatter plot
+ggplot(membership_long_12months, aes(x = Group, y = Value)) +
+  geom_jitter(width = 0.2, alpha = 0.7, color = "steelblue") +
+  labs(title = "Scatter Plot of Membership Values by Group 12 Months Only",
+       x = "Group",
+       y = "Membership Value") +
+  coord_cartesian(ylim = c(0.4, 0.6)) +
+  theme_minimal()
+
+
+
+
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+# bray PC2
+# subset to complete data
+sam_sub<-data.frame(sam[!is.na(sam$Axis2_bc),])
+# # estimate lcga models with 1-3 classes:
+# lcgaMix <- stepFlexmix(.~ . |Subject_ID, k = 1:5, nrep = 100, 
+#                        model= FLXMRglmfix(Axis2_bc ~ age, varFix=TRUE), 
+#                        data = sam_sub, 
+#                        control = list(iter.max = 500, minprior = 0))
+# # save model
+# saveRDS(lcgaMix,"/Users/ksugino/Downloads/CANOE_Airway_LCGA_bcaxis2.rds")
+
+# inspect and compare model-fit results:
+lcgaMix<-readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/CANOE_Airway_LCGA_bcaxis2.rds")
+
+# iter converged k k0   logLik       AIC       BIC        ICL
+# 1    2      TRUE 1  1 153.7504 -301.5008 -288.0977 -288.09774 <- best
+# 2    2      TRUE 2  2 153.7515 -295.5031 -268.6969   22.88607
+# 3    9      TRUE 3  3 153.7517 -289.5034 -249.2941  215.38779
+# 4    9      TRUE 4  4 153.7515 -283.5030 -229.8906  374.19568
+# 5   13      TRUE 5  5 153.7511 -277.5023 -210.4868  466.67203
+
+# find lowest BIC, pull out best model
+low<-which(BIC(lcgaMix)==min(BIC(lcgaMix)))
+bc2<-lcgaMix@models[[low]]@cluster
+
+ggplot(sam_sub, aes(y=Axis2_bc, x=Group, color=factor(bc2), group=bc2))+
+  geom_point()+
+  geom_path(aes(group=Subject_ID))+
+  stat_summary(aes(y=Axis2_bc, x=Group,
+                   group=factor(bc2)),
+               color="black",geom = "line", 
+               fun = mean, size=5,inherit.aes = F)+
+  stat_summary(geom = "line", fun = mean, size=4, inherit.aes = T)
+
+
+
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+## age
+# ggplot(sam_sub, aes(y=Axis2_bc, x=Axis1_bc, color=Group))+
+#   geom_point()+
+#   stat_ellipse()+
+#   stat_summary(data=sam_sub %>% 
+#                  # Group the data by brand then get means
+#                  group_by(Group) %>% 
+#                  summarise(x=mean(Axis1_bc),y=mean(Axis2_bc)),
+#                aes(x=x, y=y, fill=factor(Group)), 
+#                geom = "point", 
+#                size=5, pch=21, inherit.aes = F)+
+#   geom_path(data=sam_sub %>% 
+#               # Group the data by brand then get means
+#               group_by(Group) %>% 
+#               summarise(x=mean(Axis1_bc),y=mean(Axis2_bc)),
+#             aes(x=x, y=y), inherit.aes = F,
+#             arrow = arrow(length=unit(0.30,"cm"), type="open")) +
+#   scale_fill_brewer(palette = 'Greens',
+#                     name = "Age (Months)",
+#                     labels=c(0,4,12))+
+#   scale_color_brewer(palette = 'Greens',
+#                     name = "Age (Months)",
+#                     labels=c(0,4,12))
+
+
+ggplot(sam_sub, aes(y = Axis2_bc, x = Axis1_bc, color = Group)) +
+  geom_point() +
+  stat_ellipse() +
+  stat_summary(
+    data = sam_sub %>% 
+      group_by(Group) %>% 
+      summarise(x = mean(Axis1_bc, na.rm = TRUE), 
+                y = mean(Axis2_bc, na.rm = TRUE)) %>% 
+      ungroup(),
+    aes(x = x, y = y, fill = factor(Group)),  # Ensure Group is treated as a factor
+    geom = "point", 
+    size = 5, pch = 21, inherit.aes = FALSE
+  ) +
+  geom_path(
+    data = sam_sub %>% 
+      group_by(Group) %>% 
+      summarise(x = mean(Axis1_bc, na.rm = TRUE), 
+                y = mean(Axis2_bc, na.rm = TRUE)) %>% 
+      ungroup(),
+    aes(x = x, y = y, group = Group),  # Ensure correct grouping
+    inherit.aes = FALSE,
+    arrow = arrow(length = unit(0.30, "cm"), type = "open")
+  ) +
+  scale_fill_brewer(palette = 'Greens',
+                    name = "Age (Months)",
+                    labels = c(0, 4, 12)) +
+  scale_color_brewer(palette = 'Greens',
+                     name = "Age (Months)",
+                     labels = c(0, 4, 12))
+
+
+
+# tab_temp<-table(sam_sub_3_ind$bc_clust1,sam_sub_3_ind$air2_ec_a1, useNA="always")
+# prop.table(tab_temp,margin = 1)
+# chisq.test(tab_temp)
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+sam_sub_3_ind$bc_shape<-sam_sub_3_ind$bc_clust
+sam_sub_3_ind$bc_shape<-factor(sam_sub_3_ind$bc_shape)
+levels(sam_sub_3_ind$bc_shape)<-c(21, 22, 23)
+sam_sub_3_ind$bc_shape<-as.numeric(as.character(sam_sub_3_ind$bc_shape))
+
+temp_sam<-sam_sub_2_ind %>% 
+  # Group the data by brand then get means
+  group_by(bc_shape, Group) %>% 
+  summarise(x=mean(Axis1_bc),y=mean(Axis2_bc))
+
+temp_sam$cols<-ifelse(temp_sam$bc_shape==21, "#57cae3",
+                      ifelse(temp_sam$bc_shape==22, "#c638ec",
+                             # ifelse(temp_sam$bc_shape==23,"#3884ec",
+                                     ifelse(temp_sam$bc_shape==23,"#E07A5F",
+                                           NA)))
+clust_count<-table(sam_sub_3_ind$bc_clust)
+sam_sub_3_ind$cols<-ifelse(sam_sub_3_ind$bc_shape==21, "#57cae3",
+                      ifelse(sam_sub_3_ind$bc_shape==22, "#c638ec",
+                             # ifelse(sam_sub_3_ind$bc_shape==23,"#3884ec",
+                                     ifelse(sam_sub_3_ind$bc_shape==23,"#E07A5F",
+                                           NA)))
+
+
+ggplot(sam_sub_3_ind, aes(y=Axis2_bc, x=Axis1_bc, color=Group))+
+  geom_point()+
+  stat_ellipse()+
+  scale_color_manual(values = c("#57cae3",
+                                "#c638ec",
+                                # "#3884ec",
+                                 "#E07A5F"
+                                ),
+                     name="Clusters \nPC1",
+                     labels=c(paste0("1 (n=",clust_count[1], ")"),
+                              paste0("2 (n=",clust_count[2], ")"),
+                              paste0("3 (n=",clust_count[3], ")")
+                              # paste0("2-1 (n=",clust_count[3], ")"),
+                              # paste0("2-2 (n=",clust_count[4], ")")
+                              )
+  )+
+    # scale_color_brewer(palette = 'Greens',
+    #                 name = "Age (Months)",
+    #                 labels=c(0,4,12))+
+  geom_path(data=temp_sam,
+            aes(x=x, y=y, group=bc_shape),
+            arrow = arrow(length=unit(0.30,"cm"), type="open"),
+            colour = temp_sam$cols,
+            linewidth = 1.5,
+            inherit.aes = F) +
+  stat_summary(data=temp_sam,
+               aes(x=x, y=y,
+                   fill=factor(Group), shape=bc_shape),
+               geom = "point", 
+               size=5, inherit.aes = F) +
+  scale_shape_identity() +
+  scale_fill_brewer(palette = 'Greens',
+                    name = "Age (Months)",
+                    labels=c(0,4,12))+
+  guides(shape = FALSE,
+         colour = guide_legend(override.aes = list(shape = c(16,15,18), size=4)),
+         fill = guide_legend(override.aes = list(shape = c(21), size=4)))
+
+
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+ggplot(sam_sub, aes(y=Axis2_bc, x=Axis1_bc, color=Age))+
+  geom_point()+
+  stat_ellipse()+
+  scale_color_brewer(palette = 'Blues',
+                    name = "Age (Months)",
+                    labels=c(0,4,12))+
+  geom_path(data=temp_sam,
+            aes(x=x, y=y, group=shape),
+            arrow = arrow(length=unit(0.30,"cm"), type="open"),
+            colour = temp_sam$cols,
+            linewidth = 1.5,
+            inherit.aes = F) +
+  stat_summary(data=temp_sam,
+               aes(x=x, y=y,
+                   fill=factor(Age), shape=shape),
+               geom = "point", 
+               size=5, inherit.aes = F) +
+  scale_shape_identity() +
+  scale_fill_brewer(palette = 'Greens',
+                    name = "Age (Months)",
+                    labels=c(0,4,12))+
+    guides(shape = FALSE,
+         fill = guide_legend(override.aes = list(shape = c(21), size=4)))
+```
+
+```{r, results='asis', message=FALSE, warning=FALSE, fig.width=12, fig.height=6}
+### Extracting the name of the participants who at 12-months (though this is only to account for rarefaction that might have removed some samples of a longitudinal trajectory, if not rarefying then each time point would be included for a given participant) fall into either cluster 1 or 2.
+
+#Extracting two latent classes#
+sam_sub <- sam_sub %>%
+  separate(bc_clust, into = c("bc_clust1", "bc_clust2"), sep = " ")
+sam_sub_test <- as.data.frame(sam_sub)
+
+bc_cluster1 <- sam_sub_test[sam_sub_test$bc_clust1 == 1, c("Subject_ID", "Group")]
+bc_cluster1_12_month <- bc_cluster1[bc_cluster1$Group == "child - 12 months",]
+write.csv(bc_cluster1_12_month, "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/bc1_names.csv")
+
+bc_cluster2 <- sam_sub_test[sam_sub_test$bc_clust1 == 2, c("Subject_ID", "Group")]
+bc_cluster2_12_month <- bc_cluster2[bc_cluster2$Group == "child - 12 months",]
+write.csv(bc_cluster2_12_month, "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/bc2_names.csv")
+
+#Extracting three latent classes#
+sam_sub_3 <- sam_sub
+sam_sub_3$bc_clust<-paste(bc1_3Group,bc2)
+sam_sub_3$bc_shape<-factor(sam_sub_3$bc_clust)
+#levels(sam_sub_3$bc_shape)<-c(21, 22)
+#sam_sub_3$bc_shape<-as.numeric(as.character(sam_sub_3$bc_shape))
+
+
+sam_sub_3_ind <- sam_sub_3 %>%
+  separate(bc_clust, into = c("bc_clust1", "bc_clust2"), sep = " ")
+sam_sub_3_ind <- as.data.frame(sam_sub_3_ind)
+
+
+bc_3cluster1 <- sam_sub_3_ind[sam_sub_3_ind$bc_clust == 1, c("Subject_ID", "Group")]
+bc_3cluster1_12_month <- bc_3cluster1[bc_3cluster1$Group == "child - 12 months",]
+GMM3_list_cluster1 <- as.list(bc_3cluster1_12_month$Subject_ID)
+write.csv(bc_3cluster1_12_month, "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/Three Clusters/LCA3_1names.csv")
+
+bc_3cluster2 <- sam_sub_3_ind[sam_sub_3_ind$bc_clust == 2, c("Subject_ID", "Group")]
+bc_3cluster2_12_month <- bc_3cluster2[bc_3cluster2$Group == "child - 12 months",]
+GMM3_list_cluster2 <- as.list(bc_3cluster2_12_month$Subject_ID)
+write.csv(bc_3cluster2_12_month, "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/Three Clusters/LCA3_2names.csv")
+
+bc_3cluster3 <- sam_sub_3_ind[sam_sub_3_ind$bc_clust == 3, c("Subject_ID", "Group")]
+bc_3cluster3_12_month <- bc_3cluster3[bc_3cluster3$Group == "child - 12 months",]
+GMM3_list_cluster3 <- as.list(bc_3cluster3_12_month$Subject_ID)
+write.csv(bc_3cluster3_12_month, "/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/Three Clusters/LCA3_3names.csv")
+
+```
+
+
+```{r}
+library(dplyr)
+
+feeding_6mo <- feeding %>%
+  filter(ifp_visit == "child - 6 months")
+
+merged_bf_GMM_clust1df <- bc_3cluster1_12_month %>%
+  left_join(feeding_6mo, by = c("Subject_ID" = "canoe_pid_child")) %>%
+  select(Subject_ID, Group, ifp_c01)
+
+merged_bf_GMM_clust2df <- bc_3cluster2_12_month %>%
+  left_join(feeding_6mo, by = c("Subject_ID" = "canoe_pid_child")) %>%
+  select(Subject_ID, Group, ifp_c01)
+
+merged_bf_GMM_clust3df <- bc_3cluster3_12_month %>%
+  left_join(feeding_6mo, by = c("Subject_ID" = "canoe_pid_child")) %>%
+  select(Subject_ID, Group, ifp_c01)
+
+
+# Count responses in each group
+counts_df <- data.frame(
+  Group = c("GMM1", "GMM2", "GMM3"),
+  Response_1 = c(sum(merged_bf_GMM_clust1df$ifp_c01 == 1, na.rm=TRUE), sum(merged_bf_GMM_clust2df$ifp_c01 == 1, na.rm=TRUE), sum(merged_bf_GMM_clust3df$ifp_c01 == 1, na.rm=TRUE)),
+  Response_2 = c(sum(merged_bf_GMM_clust1df$ifp_c01 == 2, na.rm=TRUE), sum(merged_bf_GMM_clust2df$ifp_c01 == 2, na.rm=TRUE), sum(merged_bf_GMM_clust3df$ifp_c01 == 2, na.rm=TRUE))
+)
+
+
+# Create contingency table (rows = groups, columns = response types)
+contingency_table <- as.matrix(counts_df[, c("Response_1", "Response_2")])
+rownames(contingency_table) <- counts_df$Group
+
+# Run Chi-squared test
+chisq.test(contingency_table)
+
+
+
+
+
+
+### for Eczema data###
+sam_sub$bc1 <- bc1
+sam_sub$bc1_3Group <- bc1_3Group
+sam_sub$scorad_bin <- ifelse(sam_sub$scorad_q7 >= 1, ">1", "<=1")
+table(sam_sub$bc1, sam_sub$scorad_bin)
+
+
+# Filter the dataframe
+sam_sub_filtered <- sam_sub[sam_sub$Group == "child - 12 months", ]
+
+# Create binary scorad category
+sam_sub_filtered$scorad_bin <- ifelse(sam_sub_filtered$scorad_q7 > 1, ">1", "<=1")
+
+# Create the 2x2 table
+tab <- table(sam_sub_filtered$bc1_3Group, sam_sub_filtered$scorad_bin)
+tab
+
+chisq.test(tab)
+
+
+phy_genus <- tax_glom(phy, taxrank = "Genus")
+phy_genus_rel <- transform_sample_counts(phy_genus, function(x) x / sum(x))
+phy_genus_melt <- psmelt(phy_genus_rel)
+phy_genus_melt_filter <- phy_genus_melt[phy_genus_melt$Group == "child - 12 months", ]
+
+
+# Step 1: Sum abundance per Sample and Genus
+agg_df <- aggregate(Abundance ~ Sample + Genus, data = phy_genus_melt_filter, sum)
+
+# Step 2: Split by Sample
+split_df <- split(agg_df, agg_df$Sample)
+
+# Step 3: For each sample, find the genus with the highest abundance
+dominant_list <- lapply(split_df, function(df) {
+  df[which.max(df$Abundance), c("Sample", "Genus")]
+})
+
+# Step 4: Combine results into a data frame
+dominant_genus_df <- do.call(rbind, dominant_list)
+colnames(dominant_genus_df)[2] <- "DominantGenus"
+row.names(dominant_genus_df) <- NULL
+
+sam_sub$Sample <- rownames(sam_sub)
+sam_sub_merged <- merge(sam_sub, dominant_genus_df, by = "Sample")
+
+table(sam_sub_merged$bc1_3Group, sam_sub_merged$Genus)
+
+```
+
+```{r}
+###From Kam's updated code for LGCA, June 16 2025:
+require(reshape2)
+require(vegan)
+require(phyloseq)
+require(MASS)
+require(ggplot2)
+require(ggalluvial)
+require(dplyr)
+library(flexmix)
+library(gridExtra)
+require(kableExtra)
+require(table1)
+require(tidyr)
+
+# set wd
+knitr::opts_knit$set(root.dir = '/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST')
+
+source("~/Library/CloudStorage/Box-Box/general_analysis_scripts/20250103_beta_div_calc_stats_plots.R")
+source("/Users/ediessy/Downloads/20250610_LCGA_GMM_GMM2_code.R")
+source("~/Library/CloudStorage/Box-Box/general_analysis_scripts/20250610_LCGA_GMM_GMM2_code.R")
+
+sample_data(phy_tss)$Group<-factor(sample_data(phy_tss)$Group, levels=c("child - newborn","child - 4 months","child - 12 months"))
+
+# --- 1. Agglomerate to Genus ---
+phy_abundance <- tax_glom(phy_tss, taxrank = "Genus")
+phy_relabund  <- transform_sample_counts(phy_abundance, function(x) x/sum(x))
+
+# --- 2. Extract abundance matrix: samples x genera ---
+abund <- as(otu_table(phy_relabund), "matrix")
+if (taxa_are_rows(phy_relabund)) abund <- t(abund)
+
+# --- 3. Pull genus names corresponding to taxa ---
+tax_df <- as.data.frame(tax_table(phy_relabund))
+genus_names <- tax_df$Genus
+
+# --- 4. For each sample, find the dominant genus (highest relative abundance) ---
+dom_genus <- apply(abund, 1, function(x) {
+  if (sum(x) == 0) return(NA_character_)
+  genus_names[which.max(x)]
+})
+
+# --- 5. Add dominant genus to sample_data ---
+sample_data(phy_tss)$Genus <- dom_genus
+sam$domgen_sum <- dom_genus
+
+# pull out dfs
+#sam<-data.frame(sample_data(phy_tss))
+taxa<-data.frame(tax_table(phy_tss))
+sam$domgen_sum<-factor(ifelse(phy_tss@sam_data$Genus=="Haemophilus",
+                                                     "Haemophilus",
+                                                     ifelse(phy_tss@sam_data$Genus=="Corynebacterium",
+                                                            "Corynebacterium",
+                                                            ifelse(phy_tss@sam_data$Genus=="Dolosigranulum",
+                                                                   "Dolosigranulum",
+                                                                   ifelse(phy_tss@sam_data$Genus=="Staphylococcus",
+                                                                          "Staphylococcus",
+                                                                          ifelse(phy_tss@sam_data$Genus=="Streptococcus",
+                                                                                 "Streptococcus",
+                                                                                 ifelse(phy_tss@sam_data$Genus=="Moraxella",
+                                                                                        "Moraxella",
+                                                                                        "Other")))))),
+                                              levels=c("Moraxella","Streptococcus",
+                                                       "Staphylococcus","Dolosigranulum",
+                                                       "Corynebacterium","Haemophilus","Other"))
+sam$Group_number <- ifelse(sam$Group == "child - newborn", 0,
+                    ifelse(sam$Group == "child - 4 months", 4,
+                    ifelse(sam$Group == "child - 12 months", 12, NA)))
+sam$Group_number<-as.numeric(as.character(sam$Group_number))
+otu<-data.frame((otu_table(phy_tss)))
+colnames(otu)<-data.frame(tax_table(phy_tss))$Genus
+otu_sub<-otu[,colnames(otu)%in%levels(sam$domgen_sum)]
+
+
+
+# # BETA DIVERSITY ON ONLY REPEATED DATA for Bray Curtis and Sorensen
+# ## calc beta diversity
+# # step 1: calculate PCoA ordination
+temp_beta<-beta_div_calc(phy_tss_clean,dists = c("bray", "sorensen"))
+
+#phy_stats<-readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/Kam_CANOE_LCGS_TEST/CANOE_Airway_LCGA_20250224.rds")
+#temp_beta<-phy_stats[[1]]
+#test_stats<-phy_stats[[2]]
+
+
+#bc_lcga<-readRDS("~/Library/CloudStorage/Box-Box/20241009_LAMB_analysis/20241105_LAMB_analysis_code/outputs/20250612_LAMB_bray_lcga_models.rds")
+
+# Extract Axis.1 scores
+axis1_vals <- temp_beta[["bray"]][["vectors"]][, "Axis.1"]
+axis1_vals_sorensen <- temp_beta[["sorensen"]][["points"]][,1]
+
+# Make sure it's a named vector (sample names as names)
+head(axis1_vals)
+# Should look like: named vector with sample IDs
+
+# Confirm that rownames match (optional sanity check)
+all(names(axis1_vals) %in% rownames(sam))  # Should return TRUE
+
+# Add as a new column to sam (matching by rownames)
+sam$Axis1_bc <- axis1_vals[rownames(sam)]
+sam$Axis1_sorensen <- axis1_vals_sorensen[rownames(sam)]
+
+# Extract Axis.2 scores
+axis2_vals <- temp_beta[["bray"]][["vectors"]][, "Axis.2"]
+axis2_vals_sorensen <- temp_beta[["sorensen"]][["points"]][,2]
+
+# Add as a new column to sam (matching by rownames)
+sam$Axis2_bc <- axis2_vals[rownames(sam)]
+sam$Axis2_sorensen <- axis2_vals_sorensen[rownames(sam)]
+
+
+sam_sub < -data.frame(sam[!is.na(sam$Axis1_bc),])
+
+models_bc_pc1<-lcga_gmm_calc(sam_data = sam_sub,
+                                  y_var="Axis1_bc",
+                                  age_col="Age",
+                                  models="lcga",
+                                  subjectid = "Subject_ID",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=100, # increase to 100+
+                                  iter.max=10, # increase to 10+
+                                  seed=31415)
+
+
+models_bc_pc2<-lcga_gmm_calc(sam_data=sam_sub,
+                                  y_var="Axis2_bc",
+                                  age_col="Age",
+                                  models="lcga",
+                                  subjectid = "Subject_ID",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=100, # increase to 100+
+                                  iter.max=500, # increase to 500+
+                                  seed=31415)
+
+bc_collect<-list(pc1=models_bc_pc1,
+                 pc2=models_bc_pc2)
+lcga_gmm_table(models = models_bc_pc1)
+#Cluster 1: 294.688
+#Cluster 2: 242.606 ***
+#Cluster 3: 262.756
+#Cluster 4: 284.128
+#Cluster 5: 304.723
+
+lcga_gmm_table(models = models_bc_pc2)
+#Cluster 1: -212.371 ***
+#Cluster 2: -192.022
+#Cluster 3: -171.672
+#Cluster 4: -151.322
+#Cluster 5: -130.972
+
+t1<-lcga_gmm_table(models = bc_collect[[1]], name_append = "PC1")
+t2<-lcga_gmm_table(models = bc_collect[[2]], name_append = "PC2")
+
+t1 %>%
+  kable_styling(full_width = FALSE, position = "float_left")
+
+bc2_pc1<-bc_collect$pc1$lcga@models[[2]]@cluster
+bc2_pc2<-bc_collect$pc2$lcga@models[[1]]@cluster
+
+bc4_pc1<-bc_collect$pc1$lcga@models[[2]]@cluster
+bc4_pc2<-bc_collect$pc2$lcga@models[[2]]@cluster
+
+bc_clust_2<-paste0(bc2_pc1, "-",bc2_pc2)
+bc_clust_4<-paste0(bc4_pc1, "-",bc4_pc2)
+
+sam_sub$bcclust_2<-bc_clust_2
+sam_sub$bcclust_4<-bc_clust_4
+                                    
+###Now running the model for Sorensen data###
+sam_sub <- data.frame(sam[!is.na(sam$Axis1_sorensen),])
+
+models_sorensen_pc1<-lcga_gmm_calc(sam_data = sam_sub,
+                                  y_var="Axis1_sorensen",
+                                  age_col="Age",
+                                  models="lcga",
+                                  subjectid = "Subject_ID",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=100, # increase to 100+
+                                  iter.max=10, # increase to 10+
+                                  seed=31415)
+
+
+models_sorensen_pc2<-lcga_gmm_calc(sam_data=sam_sub,
+                                  y_var="Axis2_sorensen",
+                                  age_col="Age",
+                                  models="lcga",
+                                  subjectid = "Subject_ID",
+                                  cluster_min=1, cluster_max=5,
+                                  nrep=100, # increase to 100+
+                                  iter.max=500, # increase to 500+
+                                  seed=31415)
+
+sorensen_collect<-list(pc1=models_sorensen_pc1,
+                 pc2=models_sorensen_pc2)
+lcga_gmm_table(models = models_sorensen_pc1)
+#Cluster 1: -804.180 ***
+#Cluster 2: -784.807
+#Cluster 3: -765.376
+#Cluster 4: -745.217
+#Cluster 5: -725.830
+
+lcga_gmm_table(models = models_sorensen_pc2)
+#Cluster 1: -639.943 
+#Cluster 2: -736.932 ***
+#Cluster 3: -722.194
+#Cluster 4: -704.204
+#Cluster 5: -683.854
+
+t1_sorensen<-lcga_gmm_table(models = sorensen_collect[[1]], name_append = "PC1")
+t2_sorensen<-lcga_gmm_table(models = sorensen_collect[[2]], name_append = "PC2")
+
+
+#t1 %>%
+  #kable_styling(full_width = FALSE, position = "float_left")
+
+sorensen2_pc1<-sorensen_collect$pc1$lcga@models[[1]]@cluster
+sorensen2_pc2<-sorensen_collect$pc2$lcga@models[[2]]@cluster
+
+sorensen_clust_2<-paste0(sorensen2_pc1, "-",sorensen2_pc2)
+
+sam_sub$clust_sorensen_2<-sorensen_clust_2
+
+get_bic_step <- function(obj) {
+  stopifnot(inherits(obj, "stepFlexmix"))
+  ks <- sort(unique(obj@k))                 # k values tried (e.g., 1:5)
+  bics <- sapply(ks, function(k) BIC(getModel(obj, k)))
+  tibble(k = ks, BIC = as.numeric(bics))
+}
+
+bic_tbl <- imap_dfr(models_sorensen_pc2, ~ get_bic_step(.x) %>% mutate(model_id = .y)) %>%
+  relocate(model_id, k, BIC)
+
+bic_tbl
+
+```
+
+#Chi^2 test for trajectories
+```{r}
+library(knitr)
+library(kableExtra)
+
+multi_chi_output <- function(df,
+                                        age_col = "Age",
+                                        vars1,     # vector of variables to test
+                                        vars2) {   # vector of comparison variables
+df_age4 <- df[df[[age_col]] == 4, ]
+
+  res_list <- list()
+  counter <- 1
+
+  for (v1 in vars1) {
+    for (v2 in vars2) {
+
+      tmp <- df_age4
+
+      tmp[[v1]] <- as.factor(tmp[[v1]])
+      tmp[[v2]] <- as.factor(tmp[[v2]])
+
+      tbl <- table(tmp[[v1]], tmp[[v2]])
+
+      test <- suppressWarnings(chisq.test(tbl))
+
+      res_list[[counter]] <- data.frame(
+        Comparison = paste0(v1, "_vs_", v2),
+        Var1 = v1,
+        Var2 = v2,
+        ChiSq = unname(test$statistic),
+        df = unname(test$parameter),
+        p_value = test$p.value,
+        stringsAsFactors = FALSE
+      )
+
+      counter <- counter + 1
+    }
+  }
+
+  # Combine all rows
+  df_out <- do.call(rbind, res_list)
+
+  # Sort by p-value ascending
+  df_out <- df_out[order(df_out$p_value), ]
+
+  # Bold p-values < 0.05
+  df_out$p_value_fmt <- ifelse(df_out$p_value < 0.05,
+                               paste0("**", sprintf("%.4f", df_out$p_value), "**"),
+                               sprintf("%.4f", df_out$p_value))
+
+  # Build final display dataframe
+  df_final <- df_out[, c("Comparison", "Var1", "Var2", "ChiSq", "df", "p_value_fmt")]
+
+ tab <- kable(df_final,
+             caption = "Chi-squared tests (Age = 4), sorted by p-value",
+             col.names = c("Comparison", "Var1", "Var2", "ChiSq", "df", "p-value"),
+             escape = FALSE,
+             digits = 4,
+             align = "c",
+             row.names = FALSE) %>%
+       kable_styling(full_width = FALSE, position = "center")
+
+return(tab)
+}
+
+
+vars_to_test <- c("wheeze12m", "chronic_rhinitis12m", "atopic_dermatitis12m", "food_allergy12m", "wheeze24m", "wheeze24m_current", "chronic_rhinitis24m", "chronic_rhinitis24m_current", "atopic_dermatitis24m", "atopic_dermatitis24m_current", "food_allergy24m", "food_allergy24m_current", "wheeze36m", "wheeze36m_current", "chronic_rhinitis36m", "chronic_rhinitis36m_current", "atopic_dermatitis36m", "atopic_dermatitis36m_current", "food_allergy36m", "food_allergy36m_current")
+vars_to_compare <- c("clust_sorensen_2", "clust_sorensen_3", "bcclust_2", "bcclust_4")
+
+subset_vars_to_test <- c("chronic_rhinitis12m", "chronic_rhinitis24m", "chronic_rhinitis24m_current", "chronic_rhinitis36m", "chronic_rhinitis36m_current")
+
+table_output <- multi_chi_output(sam_sub,
+                            vars1 = subset_vars_to_test,
+                            vars2 = vars_to_compare)
+save_kable(table_output, "~/Desktop/chi_sq_results_subset.pdf")
+
+```
+
+```{r}
+#Plotting Trajectories over dominant genera
+
+###Bray Curtis first###
+sam_sub$clust_2<-sorensen_clust_2
+sam_sub$shape_2<-factor(sam_sub$clust_2)
+#levels(sam$shape)<-c(21, 22, 23, 24)
+#levels(sam_sub$shape) <- c(21,22,23)
+levels(sam_sub$shape_2) <- c(21,22)
+sam_sub$shape_2<-as.numeric(as.character(sam_sub$shape_2))
+
+temp_sam_2<-sam_sub %>% 
+  # Group the data by brand then get means
+  dplyr::group_by(Age, shape_2) %>% 
+  dplyr::summarise(x=mean(Axis1_bc),y=mean(Axis2_bc))
+
+temp_sam_2$cols<-ifelse(temp_sam2$shape_2==21, "#57cae3",
+                      ifelse(temp_sam2$shape_2==22, "#3884ec",
+                             #ifelse(temp_sam$shape==23,"#c638ec",
+                                    #ifelse(temp_sam$shape==24,"#E07A5F",
+                                           # ifelse(temp_sam$shape==25,"#f06c6c",
+                                           #        ifelse(temp_sam$shape==8,"#99db0b",
+                                           NA))
+#)
+
+# set trajectory cluster names
+#clust_t<-c("1-1","1-2","2-1","2-2")
+library(ggnewscale)
+#clust_t <- c("1-1","2-1","3-1")
+clust_t<- c("Trajectory 1", "Trajectory 2")
+ggplot(sam, aes(y=Axis2_bc, x=Axis1_bc, color=domgen_sum)) +
+  geom_point(alpha=0.5) +
+  scale_color_discrete(name = "Dominant Genus") +
+  # Override legend for points: force points, no lines/arrows
+  guides(color = guide_legend(override.aes = list(shape = 16, linetype = 0, size = 5, stroke = 1.5))) +
+  new_scale_color() +  # Reset color scale for paths
+  
+  geom_path(data=temp_sam_2,
+            aes(x=x, y=y, group=shape_2, color = cols),
+            arrow = arrow(length = unit(0.30, "cm"), type = "open"),
+            linewidth = 1.5,
+            inherit.aes = FALSE,
+            show.legend = TRUE) +
+  scale_color_manual(name = "LCGA Trajectories",
+                     values = unique(temp_sam_2$cols),
+                     labels = clust_t) +
+  stat_summary(data=temp_sam,
+               aes(x=x, y=y,
+                   fill=factor(Age), shape=I(shape_2)),
+               geom = "point",
+               size=5,
+               inherit.aes = FALSE) +
+  scale_shape_identity() +
+  scale_fill_brewer(palette = 'Greens',
+                    name = "Age (Months)"
+                    #,
+                    #labels = c(1,2,3,5,6,7,8,9,10)
+                    ) +
+  xlab(paste("PC1","(",round(eig[1,], digits=1), "%", ")", sep="")) +
+  ylab(paste("PC2","(",round(eig[2,], digits=1), "%", ")", sep="")) +
+  guides(shape = FALSE,
+         fill = guide_legend(override.aes = list(pch=21, lty = 0, size = 4), ncol = 1)
+          # No override on colour here, because we already handled points' color legend above
+  )
+
+
+###Sorensen Here###
+sam_sub$clust_sorensen_2 <- sorensen_clust_2
+sam_sub$shape_sorensen_2<-factor(sam_sub$clust_sorensen_2)
+#levels(sam$shape)<-c(21, 22, 23, 24)
+#levels(sam_sub$shape_sorensen) <- c(21,22,23)
+levels(sam_sub$shape_sorensen_2) <- c(21,22)
+sam_sub$shape_sorensen_2<-as.numeric(as.character(sam_sub$shape_sorensen_2))
+
+temp_sam_sorensen<-sam_sub %>% 
+  # Group the data by brand then get means
+  dplyr::group_by(Age, shape_sorensen_2) %>% 
+  dplyr::summarise(x=mean(Axis1_sorensen),y=mean(Axis2_sorensen))
+
+temp_sam_sorensen$cols<-ifelse(temp_sam_sorensen$shape_sorensen_2==21, "#006400",
+                      ifelse(temp_sam_sorensen$shape_sorensen_2==22, "#D41159", 
+                             #ifelse(temp_sam_sorensen$shape_sorensen==23,"#c638ec",
+                                    #ifelse(temp_sam_sorensen$shape_sorensen==24,"#E07A5F",
+                                           # ifelse(temp_sam_sorensen$shape_sorensen==25,"#f06c6c",
+                                           #        ifelse(temp_sam_sorensen$shape_sorensen==8,"#99db0b",
+                                           NA))
+#)
+                             
+
+# ))
+sam_sub$domgen_sum <- sam$domgen_sum
+
+sam_sub$domgen_sum<-factor(ifelse(sam_sub$Genus=="Haemophilus",
+                                                     "Haemophilus",
+                                                     ifelse(sam_sub$Genus=="Corynebacterium",
+                                                            "Corynebacterium",
+                                                            ifelse(sam_sub$Genus=="Dolosigranulum",
+                                                                   "Dolosigranulum",
+                                                                   ifelse(sam_sub$Genus=="Staphylococcus",
+                                                                          "Staphylococcus",
+                                                                          ifelse(sam_sub$Genus=="Streptococcus",
+                                                                                 "Streptococcus",
+                                                                                 ifelse(sam_sub$Genus=="Moraxella",
+                                                                                        "Moraxella",
+                                                                                        "Other")))))),
+                                              levels=c("Moraxella","Streptococcus",
+                                                       "Staphylococcus","Dolosigranulum",
+                                                       "Corynebacterium","Haemophilus","Other"))
+
+
+
+# set trajectory cluster names
+#clust_t<-c("1-1","1-2","2-1","2-2")
+library(ggnewscale)
+#clust_t <- c("1-1","2-1","3-1")
+clust_t<- c("Trajectory 1", "Trajectory 2")
+ggplot(sam_sub, aes(y=Axis2_sorensen, x=Axis1_sorensen, color=domgen_sum)) +
+  geom_point(alpha=0.5) +
+  scale_color_discrete(name = "Dominant Genus") +
+  # Override legend for points: force points, no lines/arrows
+  guides(color = guide_legend(override.aes = list(shape = 16, linetype = 0, size = 5, stroke = 1.5))) +
+  new_scale_color() +  # Reset color scale for paths
+  
+  geom_path(data=temp_sam_sorensen,
+            aes(x=x, y=y, group=shape_sorensen_2, color = cols),
+            arrow = arrow(length = unit(0.30, "cm"), type = "open"),
+            linewidth = 1.5,
+            inherit.aes = FALSE,
+            show.legend = TRUE) +
+  scale_color_manual(name = "LCGA Trajectories",
+                     values = unique(temp_sam_sorensen$cols),
+                     labels = clust_t) +
+  stat_summary(data=temp_sam_sorensen,
+               aes(x=x, y=y,
+                   fill=factor(Age), shape=I(shape_sorensen_2)),
+               geom = "point",
+               size=5,
+               inherit.aes = FALSE) +
+  scale_shape_identity() +
+  scale_fill_brewer(palette = 'Greens',
+                    name = "Age (Months)"
+                    #,
+                    #labels = c(1,2,3,5,6,7,8,9,10)
+                    ) +
+  #xlab(paste("PC1","(",round(eig[1,], digits=1), "%", ")", sep="")) +
+  #ylab(paste("PC2","(",round(eig[2,], digits=1), "%", ")", sep="")) +
+  xlab("PC1 (16.1%)") +
+  ylab("PC2 (7.56%)") +
+  guides(shape = FALSE,
+         fill = guide_legend(override.aes = list(pch=21, lty = 0, size = 4), ncol = 1)
+          # No override on color here, because we already handled points' color legend above
+  )
+
+
+ggplot(sam_sub, aes(y=Axis2_sorensen, x=Axis1_sorensen, color=domgen_sum)) +
+  geom_point(alpha=0.5) +
+  scale_color_discrete(name = "Dominant Genus") +
+  guides(color = guide_legend(override.aes = list(shape = 16, linetype = 0, size = 5, stroke = 1.5))) +
+
+  # new_scale_color() +  
+
+  # geom_path(data=temp_sam_sorensen,
+  #           aes(x=x, y=y, group=shape_sorensen_2, color = cols),
+  #           arrow = arrow(length = unit(0.30, "cm"), type = "open"),
+  #           linewidth = 1.5,
+  #           inherit.aes = FALSE,
+  #           show.legend = TRUE) +
+  
+  # scale_color_manual(name = "LCGA Trajectories",
+  #                    values = unique(temp_sam_sorensen$cols),
+  #                    labels = clust_t) +
+  
+  # stat_summary(data=temp_sam_sorensen,
+  #              aes(x=x, y=y,
+  #                  fill=factor(Age), shape=I(shape_sorensen_2)),
+  #              geom = "point",
+  #              size=5,
+  #              inherit.aes = FALSE) +
+  
+  # scale_shape_identity() +
+  
+  # scale_fill_brewer(palette = 'Greens',
+  #                   name = "Age (Months)") +
+
+  xlab("PC1 (16.1%)") +
+  ylab("PC2 (7.56%)")
+
+  # guides(shape = FALSE,
+  #        fill = guide_legend(override.aes = list(pch=21, lty = 0, size = 4), ncol = 1))
+
+
+
+
+sam_sub$Age <- factor(sam_sub$Age, levels = c(0, 4, 12))
+
+
+mean_df_PC2 <- sam_sub %>%
+  filter(clust_sorensen_2 %in% c("1-1", "1-2")) %>%
+  group_by(clust_sorensen_2, Age) %>%
+  summarise(mean_PC2 = mean(Axis2_sorensen, na.rm = TRUE), .groups = "drop")
+
+ggplot(sam_sub %>% 
+         filter(clust_sorensen_2 %in% c("1-1", "1-2")),
+       aes(x = Age, y = Axis2_sorensen,
+           group = Subject_ID,
+           color = clust_sorensen_2)) +
+  
+  # Individual trajectories
+  geom_line(alpha = 0.2) +
+  geom_point(size = 1.2) +
+  
+  # Large mean arrow
+  geom_path(data = mean_df_PC2,
+            aes(x = Age, y = mean_PC2,
+                group = clust_sorensen_2,
+                color = clust_sorensen_2),
+            linewidth = 4,
+            arrow = arrow(length = unit(0.4, "cm"), type = "closed")) +
+  
+  theme_minimal() +
+  labs(
+    x = "Age (months)",
+    y = "Principle Component 2",
+    title = "Participant-level PC2 trajectories with mean directional arrows",
+    color = "Trajectory"
+  ) +
+  scale_color_manual(values = c("1-1" = "#006400",
+                                "1-2" = "#D41159"))
+
+
+
+
+Age_12_month_sam_sub <- sam_sub[sam_sub$Age == 12, ]
+
+
+axis2_vals_sorensen <- temp_beta[["sorensen"]][["points"]][,2]
+# Extract eigenvalues
+eig_vals_sorensen <- temp_beta[["sorensen"]][["eig"]]
+
+# Remove negative or zero eigenvalues (if any, from non-Euclidean methods)
+eig_vals_sorensen <- eig_vals_sorensen[eig_vals_sorensen > 0]
+
+# Normalize to get proportion of variance explained
+eig_percents_sorensen <- eig_vals_sorensen / sum(eig_vals_sorensen)
+
+# Get % variance explained by PC1 and PC2
+pc1_sorensen_explained <- eig_percents_sorensen[1] * 100
+pc2_sorensen_explained <- eig_percents_sorensen[2] * 100
+```
+
+```{r}
+### Trying to see if slope of alpha diversity varies in each group. Will test Sorensen 3 trajectory first. ###
+fit_sorensen_2 <- lmer(Shannon ~ Age*clust_sorensen_2 + (1|Subject_ID), data = sam_sub)
+anova(fit_sorensen)
+summary(fit_sorensen)
+
+fit_sorensen_2 <- lmer(Shannon ~ Age * clust_sorensen_2 + (1|Subject_ID),
+                     data = sam_sub, REML = TRUE)
+
+library(emmeans)
+emtr <- emtrends(fit_sorensen_2, ~ clust_sorensen_2, var = "Age")
+summary(emtr)       # slope estimate + SE per group
+pairs(emtr)         # pairwise slope comparisons
+
+
+plot_testing_2 <- ggplot(sam_sub, aes(Age, Shannon, color = clust_sorensen_2)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_bw()
+
+plot_testing_2
+
+
+#Trying BC now
+fit_bc_2 <- lmer(Shannon ~ Age*clust_2 + (1|Subject_ID), data = sam_sub)
+anova(fit_bc)
+summary(fit_bc)
+
+fit_bc_2 <- lmer(Shannon ~ Age * clust_2 + (1|Subject_ID),
+                     data = sam_sub, REML = TRUE)
+
+#library(emmeans)
+emtr <- emtrends(fit_sorensen_2, ~ clust_sorensen_2, var = "Age")
+summary(emtr)       # slope estimate + SE per group
+pairs(emtr)         # pairwise slope comparisons
+
+
+plot_testing_bc <- ggplot(sam_sub, aes(Age, Shannon, color = clust_2)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_bw()
+
+plot_testing_bc
+
+#Trying to see if there is variance in the initial grouping that the child falls into
+
+birth_phy <- subset_samples(phy_tss_clean, Age == 0)
+
+# Make distance matrix (e.g., Bray-Curtis)
+dist_birth <- phyloseq::distance(birth_phy, method = "bray")
+dist_birth_sorense <- phyloseq::distance(birth_phy, method = "bray", binary = TRUE)
+
+# Metadata with trajectory group
+md_birth <- data.frame(sample_data(birth_phy))
+md_birth$clust_2 <- sam_sub[rownames(md_birth), "clust"]
+md_birth$clust_sorensen_2 <- sam_sub[rownames(md_birth), "clust_sorensen_2"]
+
+# Run PERMANOVA
+adonis2(dist_birth ~ clust_2, data = md_birth, permutations = 9999)
+adonis2(dist_birth_sorense ~ clust_sorensen_2, data = md_birth, permutations = 9999)
+```
+
+```{r}
+# Ensure sample IDs are the row names
+rownames(sam_sub) <- sam_sub$SampleID  # or whatever column matches your sample IDs
+
+sam_sub_flipped <- sam_sub
+sam_sub_flipped$Axis2_bc <- sam_sub_flipped$Axis2_bc*-1
+
+# Replace the samplsam_sub_test# Replace the sample_data in the phyloseq object
+sample_data(phy_abundance) <- sample_data(sam_sub_flipped)
+
+
+# step 1: calculate PCoA ordination
+temp_beta_test <- beta_div_calc(phy_tss_clean,c("bray","sorensen"))
+# step 2: run PERMANOVA models
+test_stats_test <- beta_div_stats(phy=phy_tss_clean,
+                           model_vars=c("domgen_sum"),
+                           dists=c("bray","sorensen"),
+                           subjectid = "Subject_ID")
+
+
+# step 3: combine into one output and save
+phy_stats_test<-list(temp_beta_test, test_stats_test)
+# saveRDS(phy_stats,"/Users/ksugino/Library/CloudStorage/Box-Box/general_analysis_scripts/beta_div_calc_stats_example.rds")
+# # read in saved RDS
+# phy_stats<-readRDS("/Users/ksugino/Library/CloudStorage/Box-Box/general_analysis_scripts/beta_div_calc_stats_example.rds")
+# # split RDS into two dfs to input into plotting function
+temp_beta_test<-phy_stats[[1]]
+test_stats_test<-phy_stats[[2]]
+
+# step 4: plot table of stats
+beta_div_stats_table(beta_div_stats=test_stats_test)
+
+# step 5: plot ordination and stats
+pl<-beta_div_plots(phy = phy_abundance,
+                       beta_div = temp_beta_test,
+                       stats = test_stats_test)
+
+
+
+```
+
+```{r}
+# install.packages(c("dplyr","purrr","gt"), Ncpus = 4)
+library(dplyr)
+library(purrr)
+library(gt)
+
+sam_sub_age4 <- sam_sub[sam_sub$Age==4,]
+sam_sub_age0 <- sam_sub[sam_sub$Age==0,]
+
+make_cluster_sig_table <- function(
+  data,
+  vars_interest,
+  clust_col   = "clust_sorensen_2",
+  group_levels = c("1-1","1-2"),
+  min_n       = 140,
+  top_n       = 20,
+  alpha       = 0.05
+) {
+  stopifnot(clust_col %in% names(data))
+
+  dat <- data %>%
+    dplyr::filter(.data[[clust_col]] %in% group_levels) %>%
+    dplyr::mutate(
+      !!clust_col := droplevels(factor(.data[[clust_col]], levels = group_levels))
+    )
+
+  # keep only vars that exist
+  vars <- intersect(vars_interest, names(dat))
+  if (length(vars) == 0) stop("None of vars_interest are present in data.")
+
+  # helper: Cramer's V
+  cramer_v <- function(tab) {
+    k <- min(nrow(tab) - 1, ncol(tab) - 1)
+    if (k <= 0) return(NA_real_)
+    chi <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+    n <- sum(tab)
+    as.numeric(sqrt(chi / (n * k)))
+  }
+
+  results <- map_dfr(vars, function(v) {
+    x <- dat[[v]]
+    g <- dat[[clust_col]]
+
+    # drop rows with NA in x or group
+    keep <- !(is.na(x) | is.na(g))
+    x <- x[keep]; g <- g[keep]
+
+    n_tot <- length(x)
+    if (n_tot <= min_n) {
+      return(tibble(
+        Variable = v, Type = NA_character_,
+        n_total = n_tot, n_g1 = NA_integer_, n_g2 = NA_integer_,
+        p_raw = NA_real_, p_adj = NA_real_,
+        effect = NA_real_, effect_label = NA_character_,
+        test = NA_character_
+      ))
+    }
+
+    # counts per group
+    n_g1 <- sum(g == group_levels[1])
+    n_g2 <- sum(g == group_levels[2])
+
+    if (is.numeric(x)) {
+      # Wilcoxon rank-sum
+      p <- tryCatch(wilcox.test(x ~ g, exact = FALSE)$p.value, error = function(e) NA_real_)
+      med1 <- suppressWarnings(median(x[g == group_levels[1]], na.rm = TRUE))
+      med2 <- suppressWarnings(median(x[g == group_levels[2]], na.rm = TRUE))
+      eff <- med2 - med1
+      eff_lab <- if (is.finite(eff)) sprintf("Δ median = %.3g", eff) else NA_character_
+
+      tibble(
+        Variable = v, Type = "numeric",
+        n_total = n_tot, n_g1 = n_g1, n_g2 = n_g2,
+        p_raw = p, p_adj = NA_real_,
+        effect = eff, effect_label = eff_lab,
+        test = "wilcox"
+      )
+    } else {
+      # categorical: uncorrected chi-square unless expected < 5 → Fisher
+      f <- factor(x)
+      # guard against all-NA or single-level after filtering
+      if (nlevels(f) < 1) {
+        return(tibble(
+          Variable = v, Type = "categorical",
+          n_total = n_tot, n_g1 = n_g1, n_g2 = n_g2,
+          p_raw = NA_real_, p_adj = NA_real_,
+          effect = NA_real_, effect_label = NA_character_,
+          test = NA_character_
+        ))
+      }
+
+      tab <- table(g, f)
+      p <- NA_real_; eff <- NA_real_; tst <- NA_character_
+
+      # try uncorrected chi-square; compute expected; fallback to Fisher if any expected < 5
+      chi_try <- tryCatch(chisq.test(tab, correct = FALSE), error = function(e) NULL)
+      if (!is.null(chi_try)) {
+        expected <- chi_try$expected
+        if (any(expected < 5)) {
+          p <- tryCatch(fisher.test(tab)$p.value, error = function(e) NA_real_)
+          tst <- "fisher"
+        } else {
+          p <- chi_try$p.value
+          tst <- "chisq_noYates"
+        }
+      } else {
+        # structural zero/degenerate → Fisher if possible
+        p <- tryCatch(fisher.test(tab)$p.value, error = function(e) NA_real_)
+        tst <- "fisher"
+      }
+      eff <- cramer_v(tab)
+      eff_lab <- ifelse(is.na(eff), NA, sprintf("Cramer's V = %.3f", eff))
+
+      tibble(
+        Variable = v, Type = "categorical",
+        n_total = n_tot, n_g1 = n_g1, n_g2 = n_g2,
+        p_raw = p, p_adj = NA_real_,
+        effect = eff, effect_label = eff_lab,
+        test = tst
+      )
+    }
+  })
+
+  # BH adjust across all valid p-values
+  results <- results %>%
+    mutate(p_adj = ifelse(is.na(p_raw), NA_real_, p.adjust(p_raw, method = "BH"))) %>%
+    arrange(is.na(p_adj), p_adj, is.na(p_raw), p_raw)
+
+  # restrict to n > min_n and take top_n by adjusted p
+  results_top <- results %>%
+    filter(n_total > min_n) %>%
+    slice_head(n = top_n)
+
+  # Build gt table: bold BH-significant p-values
+  gt_tab <- results_top %>%
+    transmute(
+      Variable,
+      Type,
+      `n total` = n_total,
+      `TRUE` = n_g1,
+      `FALSE` = n_g2,
+      Test = test,
+      Effect = effect_label,
+      `p` = p_raw,
+      `p (BH)` = p_adj
+    ) %>%
+    gt() %>%
+    fmt_number(columns = c(`p`, `p (BH)`), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = `p (BH)` < alpha, columns = `p (BH)`)
+    ) %>%
+    tab_options(table.font.size = px(13))
+
+  attr(gt_tab, "data_df") <- results_top
+  gt_tab
+}
+
+
+vars_interest_full <- c(
+  "canoe_site.x","dem_c_1","dem_c_2","dem_c_3",
+  "scorad_q1","scorad_q3","scorad_q4","scorad_q5","scorad_q6","scorad_q7",
+  "total_ige_kupl","f2_kuapl_milk","f245_kuapl_whole_egg","f13_kuapl_peanut",
+  "e5_kuapl_dog","e1_kuapl_cat","e88_kuapl_mouse","d2_kuapl_d_far",
+  "i6_kuapl_cockroach","mx1_kuapl_mold_mix","gx2_kuapl_grass_mix",
+  "wx1_kuapl_weed_mix","tx1_kuapl_tree_mix","t14_kuapl_poplar",
+  "air2_ec_a1","air2_ec_a1b","air2_ec_a1c","air2_ec_a1d","air2_ec_a1e","air2_ec_a2",
+  "air2_ec_a3","air2_ec_a4","air2_ec_a4a_recall","air2_ec_a4b","air2_ec_a5",
+  "air2_ec_a6","air2_ec_a6b","air2_ec_a7","air2_ec_a7a","air2_ec_a8","air2_ec_a8a","air2_ec_a8b",
+  "air2_ec_b1","air2_ec_b1a","air2_ec_b1b_recall","air2_ec_b1c","air2_ec_b1c1",
+  "air2_ec_b2a1","air2_ec_b2a1_age","air2_ec_b2b1","air2_ec_b2b1_age","air2_ec_b2c1","air2_ec_b2c1_age",
+  "air2_ec_b3","air2_ec_b3a","air2_ec_b4","air2_ec_b_4a","air2_ec_b5","air2_ec_b5a","air2_ec_b5b",
+  "air2_ec_b5b1","air2_ec_b6","air2_ec_b6a","air2_ec_b6b","air2_ec_b6b1",
+  "air2_ec_c1","air2_ec_c2","air2_ec_c3","air2_ec_c4","air2_ec_c5","air2_ec_c6",
+  "air2_ec_c9","air2_ec_c10_recall","air2_ec_c11","air2_ec_c12",
+  "air2_ec_d1","air2_ec_d1a___1","air2_ec_d1a___2","air2_ec_d1a___3","air2_ec_d1a___4","air2_ec_d1a___5",
+  "air2_ec_d2","air2_ec_d2a___1","air2_ec_d2a___2","air2_ec_d2a___3","air2_ec_d2a___4","air2_ec_d2a___5","air2_ec_d2a___6",
+  "air2_ec_e1","air2_ec_e2","air2_ec_e3a_recall","air2_ec_e4","air2_ec_e4a_recall","air2_ec_e5",
+  "air2_ec_e6","air2_ec_e7","air2_ec_e8","air2_ec_e8a",
+  "mediec_c_ab_q3","mediec_c_af_q1","mediec_c_af_q2","mediec_c_af_q3",
+  "mediec_c_pb_q1","mediec_c_pb_q2","mediec_c_pb_q2_dk",
+  "child...2.months_hhc_c_02a1","child...2.months_hhc_c_02a2","child...2.months_hhc_c_02b_na____6",
+  "child...2.months_hhc_c_02b1","child...2.months_hhc_c_02b2",
+  "mh2_bf_2a","mh2_bf_2a_fam___1","mh2_bf_2a_fam___2",
+  "child...6.months_pdep8a_tscore","child...6.months_pdep8a_std_error",
+  "child...6.months_pdep8a_1","child...6.months_pdep8a_2","child...6.months_pdep8a_3",
+  "child...6.months_pdep8a_4","child...6.months_pdep8a_5","child...6.months_pdep8a_6",
+  "child...6.months_pdep8a_7","child...6.months_pdep8a_8","pdep8a_tscore",
+  "child...6.months_ifp_a01","child...6.months_ifp_a02","child...6.months_ifp_a03___1",
+  "child...6.months_ifp_a03___2","child...6.months_ifp_a03___3","child...6.months_ifp_a03___4",
+  "child...6.months_ifp_a03___5","child...6.months_ifp_a03___6","child...6.months_ifp_a03___7",
+  "child...6.months_ifp_a03___8","child...6.months_ifp_a03___9","child...6.months_ifp_a03___10",
+  "child...6.months_ifp_a03___11","child...6.months_ifp_a03____8",
+  "child...6.months_ifp_b01","child...6.months_ifp_b03","child...6.months_ifp_b04",
+  "child...6.months_ifp_b11","child...6.months_ifp_b11_notfed","child...6.months_ifp_b12",
+  "child...6.months_ifp_b13","child...6.months_ifp_c01","child...6.months_ifp_c1a_perday",
+  "child...6.months_ifp_c1a_perwk","child...6.months_ifp_c1a_permon",
+  "child...9.months_ifp_a01","child...9.months_ifp_a02",
+  "child...9.months_ifp_a03___1","child...9.months_ifp_a03___2","child...9.months_ifp_a03___3",
+  "child...9.months_ifp_a03___4","child...9.months_ifp_a03___5","child...9.months_ifp_a03___6",
+  "child...9.months_ifp_a03___7","child...9.months_ifp_a03___8","child...9.months_ifp_a03___9",
+  "child...9.months_ifp_a03___10","child...9.months_ifp_a03___11","child...9.months_ifp_a03____8",
+  "child...9.months_ifp_b01","child...6.months_ifp_b03","child...9.months_ifp_b04",
+  "child...9.months_ifp_b11","child...9.months_ifp_b11_notfed","child...9.months_ifp_b12",
+  "child...9.months_ifp_b13","child...9.months_ifp_c01","child...9.months_ifp_c1a_perday",
+  "child...9.months_ifp_c1a_perwk","child...9.months_ifp_c1a_permon", "wheeze12m",  "wheeze12m_episodes", "chronic_rhinitis12m",            "atopic_dermatitis12m"
+)
+
+# Run on your object (replace with your actual data.frame)
+table_full <- make_cluster_sig_table(sam_sub_age4, vars_interest_full,
+                              clust_col = "chronic_rhinitis36m_current",
+                              group_levels = c(TRUE,FALSE),
+                              min_n = 30, top_n = 20, alpha = 0.05)
+### Note to run for missing variables you need to change the min_n. Use 230 if it is an otherwise complete dataset (12 and 24 months) ###
+
+table_full                           # show the styled table
+#df_out <- attr(tbl, "data_df")
+write.csv(df_out, "top20_cluster_sig.csv", row.names = FALSE)
+
+#Save to PNG for slides (requires webshot2; install_phantomjs once)
+# install.packages("webshot2"); webshot2::install_phantomjs()
+gtsave(table_full, "/Users/ediessy/Desktop/top20_cluster_sig.png")
+
+
+
+```
+
+
+```{r}
+#Want to calculate Faith's alpha diversity on those participants in clust_sorensen_1 and clust_sorensen_2
+```
+
+```{r}
+sam_sub_age0$domgen_sum<-factor(ifelse(sam_sub_age0$Genus=="Haemophilus",
+                                                     "Haemophilus",
+                                                     ifelse(sam_sub_age0$Genus=="Corynebacterium",
+                                                            "Corynebacterium",
+                                                            ifelse(sam_sub_age0$Genus=="Dolosigranulum",
+                                                                   "Dolosigranulum",
+                                                                   ifelse(sam_sub_age0$Genus=="Staphylococcus",
+                                                                          "Staphylococcus",
+                                                                          ifelse(sam_sub_age0$Genus=="Streptococcus",
+                                                                                 "Streptococcus",
+                                                                                 ifelse(sam_sub_age0$Genus=="Moraxella",
+                                                                                        "Moraxella",
+                                                                                        "Other")))))),
+                                              levels=c("Moraxella","Streptococcus",
+                                                       "Staphylococcus","Dolosigranulum",
+                                                       "Corynebacterium","Haemophilus","Other"))
+
+
+
+```
+
+#Trying Lasso Regression, might be superfluous info in the top, try the next one down.
+```{r}
+library(glmnet)
+library(phyloseq)
+library(dplyr)
+
+### -----------------------------
+### 1. Fix OTU orientation
+### -----------------------------
+# Make sure taxa are rows
+otu_mat <- otu_table(phy_tss)
+
+if (!taxa_are_rows(phy_tss)) {
+  otu_mat <- otu_table(as.matrix(t(otu_mat)), taxa_are_rows = TRUE)
+}
+
+phy_tss_fixed <- phyloseq(
+  otu_mat,
+  tax_table(phy_tss),
+  sample_data(phy_tss)
+)
+
+### -----------------------------
+### 2. Fix missing GENUS labels
+### -----------------------------
+tax <- as.data.frame(tax_table(phy_tss_fixed))
+tax$Genus <- as.character(tax$Genus)
+tax$Genus[is.na(tax$Genus) | tax$Genus == ""] <- "Unclassified"
+
+tax_table(phy_tss_fixed) <- as.matrix(tax)
+
+### -----------------------------
+### 3. Collapse ASVs → Genera
+### -----------------------------
+phy_genus <- tax_glom(phy_tss_fixed, taxrank = "Genus")
+
+### -----------------------------
+### 4. Convert to relative abundance
+### -----------------------------
+phy_genus_rel <- transform_sample_counts(phy_genus, function(x) x / sum(x))
+
+### -----------------------------
+### 5. Extract genus-level abundance table
+###     (Samples × Genera)
+### -----------------------------
+otu <- as.data.frame(otu_table(phy_genus_rel))
+tax <- as.data.frame(tax_table(phy_genus_rel))
+
+# Attach Genus name to each ASV row
+otu$Genus <- tax$Genus
+
+# Collapse abundances by Genus
+genus_abund <- otu %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum), .groups = "drop")
+
+# Transpose to sample × genus
+abund <- as.data.frame(t(as.data.frame(genus_abund[ , -1])))
+colnames(abund) <- genus_abund$Genus
+
+### -----------------------------
+### 6. Final: check output
+### -----------------------------
+head(abund[, 1:10])
+dim(abund)
+
+sam_sub$Moraxella_dom <- ifelse(sam_sub$Genus == "Moraxella",1,0)
+# Select genera of interest (optional)
+key_genera <- c("Moraxella", "Haemophilus", "Dolosigranulum", 
+                "Corynebacterium", "Staphylococcus", "Streptococcus")
+
+# Keep only those genera if present
+key_genera <- intersect(key_genera, colnames(abund))
+
+X <- cbind(
+  Moraxella_dom = sam_sub[, "Moraxella_dom"],
+  abund[, key_genera, drop = FALSE]
+)
+
+Xmat <- as.matrix(X)
+
+common_samps <- intersect(rownames(Xmat), rownames(sam_sub))
+
+Xmat_aligned  <- Xmat[common_samps,,drop=FALSE]
+sam_sub_align <- sam_sub[common_samps,,drop=FALSE]
+
+set.seed(481516)
+
+cvfit <- cv.glmnet(
+  x = Xmat_aligned,
+  y = sam_sub_align$chronic_rhinitis36m_current,
+  family = "binomial",
+  alpha = 0.5,        # elastic net mixing parameter
+  type.measure = "class"
+)
+
+plot(cvfit)
+
+coef(cvfit, s = "lambda.min")
+
+pred_prob <- predict(cvfit, newx = Xmat, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+
+# Accuracy
+mean(pred_class == y)
+
+# Confusion matrix
+table(Predicted = pred_class, Actual = y)
+
+library(pROC)
+roc_obj <- roc(y, pred_prob)
+auc(roc_obj)
+plot(roc_obj)
+
+```
+
+#Retry with correct subsetting for elastic net
+```{r}
+library(glmnet)
+
+make_genus_abundance <- function(ps) {
+  # 1. Fix OTU table orientation
+  otu <- otu_table(ps)
+  if (!taxa_are_rows(ps)) {
+    otu <- otu_table(t(otu), taxa_are_rows = TRUE)
+  }
+  otu <- as.data.frame(otu)
+  
+  # 2. Fix taxonomy issues
+  tax <- as.data.frame(tax_table(ps))
+  tax$Genus <- as.character(tax$Genus)
+  tax$Genus[is.na(tax$Genus) | tax$Genus==""] <- "Unclassified"
+  
+  # 3. Attach Genus names
+  otu$Genus <- tax$Genus
+  
+  # 4. Collapse ASVs to Genera
+  genus_abund <- otu %>%
+    group_by(Genus) %>%
+    summarise(across(where(is.numeric), sum), .groups="drop")
+  
+  # 5. Transpose to samples × genera
+  abund <- t(as.data.frame(genus_abund[, -1]))
+  colnames(abund) <- genus_abund$Genus
+  
+  return(as.data.frame(abund))
+}
+
+abund_all <- make_genus_abundance(phy_tss)
+
+
+#Function definition
+run_glmnet_timepoint <- function(age_value) {
+  
+  # 1. Subset metadata to this age
+  sam_tp <- sam_sub[sam_sub$Age == age_value, ]
+  
+  # 2. Intersect FIRST (before filtering)
+  common_samps <- intersect(rownames(sam_tp), rownames(abund_all))
+  sam_tp   <- sam_tp[common_samps, , drop = FALSE]
+  abund_tp <- abund_all[common_samps, , drop = FALSE]
+  
+  # 3. Remove samples with NA in predictors or outcome
+  keep <- complete.cases(sam_tp[, c("clust_sorensen_2", 
+                                    "chronic_rhinitis36m_current")])
+  sam_tp   <- sam_tp[keep, , drop = FALSE]
+  abund_tp <- abund_tp[keep, , drop = FALSE]
+  
+  if (nrow(sam_tp) < 20) {
+    stop("Not enough complete cases to fit model for age=", age_value,
+         " (n=", nrow(sam_tp), ")")
+  }
+  
+  # 4. Build df WITH rownames preserved
+  df <- data.frame(
+    clust_sorensen_2 = sam_tp$clust_sorensen_2,
+    abund_tp,
+    check.names = FALSE
+  )
+  rownames(df) <- rownames(sam_tp)
+  
+  # 5. Build model matrix and restore rownames
+  X <- model.matrix(~ ., data = df)
+  rownames(X) <- rownames(df)
+  
+  y <- sam_tp$chronic_rhinitis36m_current
+  
+  # 6. Fit elastic net
+  set.seed(123)
+  cvfit <- cv.glmnet(x = X, y = y, family = "binomial", alpha = 0.1)
+  
+  list(
+    age = age_value,
+    cvfit = cvfit,
+    X = X,
+    y = y,
+    coefs = coef(cvfit, s = "lambda.min"),
+    sample_ids = rownames(X)
+  )
+}
+
+
+# Identify dominant genus for each sample
+dominant_genus <- colnames(abund_all)[apply(abund_all, 1, which.max)]
+
+# Clean and simplify: only keep major genera
+key_genera <- c("Moraxella", "Dolosigranulum", "Haemophilus",
+                "Streptococcus", "Staphylococcus", "Corynebacterium")
+
+dom_genus_clean <- ifelse(dominant_genus %in% key_genera,
+                          dominant_genus,
+                          "Other")
+
+# Build complete predictor table
+feature_df <- data.frame(
+  sample_id = rownames(abund_all),
+  dom_genus = factor(dom_genus_clean),
+  clust_sorensen_2 = sam_sub[rownames(abund_all), "clust_sorensen_2"],
+  outcome = sam_sub[rownames(abund_all), "chronic_rhinitis36m"],
+  Age = sam_sub[rownames(abund_all), "Age"],
+  stringsAsFactors = TRUE
+)
+
+# Remove samples with missing cluster or outcome
+feature_df <- feature_df[complete.cases(feature_df), ]
+
+
+run_ecological_glmnet <- function(age_value) {
+  
+  # Subset to this timepoint
+  df <- feature_df[feature_df$Age == age_value, ]
+  
+  if (nrow(df) < 30)
+    stop("Not enough samples at age = ", age_value)
+  
+  # Model matrix
+  X <- model.matrix(~ dom_genus + clust_sorensen_2, data = df)
+  y <- df$outcome
+  
+  set.seed(123)
+  cvfit <- cv.glmnet(X, y, family = "binomial", alpha = 1)
+  
+  list(
+    age = age_value,
+    model = cvfit,
+    X = X,
+    y = y,
+    coefs_min = coef(cvfit, s = "lambda.min"),
+    coefs_1se = coef(cvfit, s = "lambda.1se"),
+    sample_ids = df$sample_id
+  )
+}
+
+fit12 <- run_ecological_glmnet(12)
+fit12$coefs_min
+
+fit4 <- run_ecological_glmnet(4)
+fit4$coefs_min
+
+fit0 <- run_ecological_glmnet(0)
+fit0$coefs_min
+
+
+
+
+#Rerun Jan 2026:
+# Subset feature data to 12 months
+
+df12age <- feature_df[feature_df$Age == 12, ]
+
+# Model matrix (same predictors as before)
+X12 <- model.matrix(~ dom_genus + clust_sorensen_2, data = df12age)
+y12 <- df12age$outcome
+
+cv_ridge_12 <- cv.glmnet(
+  x = X12,
+  y = y12,
+  family = "binomial",
+  alpha = 0            # RIDGE
+)
+pred_ridge <- predict(
+  cv_ridge_12,
+  newx = X12,
+  s = "lambda.min",
+  type = "response"
+)
+
+
+auc_ridge <- roc(y12, pred_ridge)$auc
+auc_ridge
+summary(pred_ridge)
+
+roc_ridge <- roc(y12, pred_ridge)
+plot(roc_ridge, col = "blue", lwd = 2)
+```

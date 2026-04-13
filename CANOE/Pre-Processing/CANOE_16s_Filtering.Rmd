@@ -1,0 +1,597 @@
+---
+title: "CANOE 16s: "
+author: "Elad Deiss-Yehiely"
+date: "July 2025"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r load-packages, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "dplyr", "ggplot2", "lmerTest", "phyloseq", "tidyverse", 
+  "parallel", "vegan", "ggtext", "ggpubr", "reshape2", "RColorBrewer", "ggrepel", "circlize", "SummarizedExperiment", "kableExtra", "compositions", "knitr", "DESeq2", "pheatmap", "cluster", "data.table"
+)
+sapply(required_packages, require, character.only = TRUE)
+
+
+```
+
+### 1.) Import the 16s Phyloseq
+
+```{r}
+phy_3Runs <- readRDS("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/3_Runs_Merged/dada2_phy_pruned_wtree_3Runs.rds")
+phy_3Runs
+### AM REMOVING DUPLICATE TIMEPOINTS FROM SEQUENCING ###
+phy_3Runs <- subset_samples(phy_3Runs, !(sample_names(phy_3Runs) %in% c("VAUN000542", "UWIM101853", "VAUN004162")))
+phy_3Runs
+
+
+formatted_metadata <- read.csv("/Users/ediessy/Desktop/formatted_merged_metadata_edited_2026-03-30_EDY.csv", header=T, row.names = 1)
+# colnames(formatted_metadata) <- gsub("[^[:alnum:]_]", ".", colnames(formatted_metadata))  
+# colnames(formatted_metadata) <- gsub("\\.+", ".", colnames(formatted_metadata)) 
+# colnames(formatted_metadata) <- sub("\\.$", "", colnames(formatted_metadata))
+
+# #Want to merge in data later once all the filtering has been completed so that you don't have to deal with MOCK, NEC, NTC(?)
+#sample_data(phy_3Runs) <- sample_data(formatted_metadata)
+
+
+CANOE_phy_3Runs <- prune_samples(sample_data(phy_3Runs)$Study%in% c("CANOE_Airway_16S", "CANOE_Airway_16S_Run3"), phy_3Runs)
+CANOE_phy_3Runs <- prune_samples(sample_data(CANOE_phy_3Runs)$Extractor %in% c("Kris_Grindle"), CANOE_phy_3Runs)
+
+# Remove samples with zero reads
+CANOE_phy_3Runs <- prune_samples(sample_sums(CANOE_phy_3Runs) > 0, CANOE_phy_3Runs)
+CANOE_phy_3Runs <- prune_taxa(taxa_sums(CANOE_phy_3Runs) > 0, CANOE_phy_3Runs)
+CANOE_phy_3Runs
+
+#First pass filter on all non-bacteria taxa
+CANOE_phy_3Runs <- CANOE_phy_3Runs %>% subset_taxa(Kingdom == "Bacteria") #15856 taxa and 926 samples prior to sub-setting, 15668 post
+CANOE_phy_3Runs <- CANOE_phy_3Runs %>% subset_taxa( Family!= "Mitochondria" | is.na(Family) & Order!="Chloroplast" | is.na(Order)) #15257 taxa
+taxa_names(CANOE_phy_3Runs) <- paste0('ASV_', 1:length(taxa_names(CANOE_phy_3Runs)))
+phy_tree(CANOE_phy_3Runs) <- ape::root(phy_tree(CANOE_phy_3Runs), 1, resolve.root=T)
+CANOE_phy_3Runs <- prune_taxa(taxa_sums(CANOE_phy_3Runs) > 0, CANOE_phy_3Runs)
+```
+
+
+###Negative Control Filtering###
+
+```{r}
+#NTC removal was already done for each individual run, whereas NEC removal was not
+#Manual addition of a column SampleType for NEC, NTC, MOCK, Sample in the metadata table. Will probably need to do this with any changes (like adding in new data, though there you should just add it to the optimized/finalized phyloseq object).
+source("/Users/ediessy/Desktop/Postdoc UCSF/CANOE/Phylo_Tree/NegControlRemoval_func.R")
+CANOE_phy_3Runs_noneg <- ntc_filter(CANOE_phy_3Runs)
+CANOE_phy_3Runs_noneg #14662 taxa and 905 samples (14 MOCK and 891 sample, which is 297 complete longitudinal children).
+
+
+CANOE_phy_3Runs_noneg <- subset_samples(CANOE_phy_3Runs_noneg, SampleType == "sample")
+
+#Remember that HFHS001257 was removed as there were not enough reads in the dada2 processing stage
+formatted_metadata <- formatted_metadata[rownames(formatted_metadata) != "HFHS001257", ]
+
+#Needs to be character(0) to make sure that the merge can happen properly!
+base::setdiff(rownames(formatted_metadata), sample_names(CANOE_phy_3Runs_noneg))
+base::setdiff(sample_names(CANOE_phy_3Runs_noneg), rownames(formatted_metadata))
+
+
+sample_data(CANOE_phy_3Runs_noneg) <- sample_data(formatted_metadata)
+
+
+```
+
+###Alpha-Diversity###
+
+```{r}
+#Plotted both with and without total sum scaling, should give similar results but want to be thorough. TSS does not add much and will only do non-transformed data here to include the Chao-1
+
+# Step 1: Extract alpha diversity metrics (already done)
+otu_data <- as.matrix(otu_table(CANOE_phy_3Runs_noneg))
+phy_tree <- phy_tree(CANOE_phy_3Runs_noneg)
+
+sample_data(CANOE_phy_3Runs_noneg)$Chao1 <- t(estimateR(otu_data))[, 2] #Cannot use with TSS, it needs to be counts of unique taxa
+sample_data(CANOE_phy_3Runs_noneg)$Shannon <- vegan::diversity(otu_data, index = "shannon")
+sample_data(CANOE_phy_3Runs_noneg)$Pileou_Evenness <- vegan::diversity(otu_data) / log(specnumber(otu_data))
+sample_data(CANOE_phy_3Runs_noneg)$Faith_PD <- picante::pd(otu_data, phy_tree, include.root = TRUE)[, 1]
+
+# Step 2: Convert sample_data to data.frame
+alpha_data <- as.data.frame(sample_data(CANOE_phy_3Runs_noneg))
+
+# Step 3: Convert Age variable to a factor or ordered factor
+# (Optional but useful for plotting)
+alpha_data$Age <- as.factor(alpha_data$Age)  # or use ordered() if Age is numeric
+
+# Step 4: Melt alpha diversity metrics into long format
+alpha_long_age <- reshape2::melt(
+  alpha_data,
+  id.vars = "Age",
+  measure.vars = c("Chao1", "Shannon", "Pileou_Evenness", "Faith_PD"),
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+# Step 5: Remove rows with missing values
+alpha_long_age <- alpha_long_age[!is.na(alpha_long_age$Value), ]
+
+# Loop over metrics and run pairwise Wilcoxon tests
+metrics <- unique(alpha_long_age$Metric)
+
+for (m in metrics) {
+  cat("=== Wilcoxon Tests for", m, "===\n")
+  sub_data <- alpha_long_age[alpha_long_age$Metric == m, ]
+  
+  result <- pairwise.wilcox.test(
+    x = sub_data$Value,
+    g = sub_data$Age,
+    p.adjust.method = "BH"  # Benjamini-Hochberg adjustment
+  )
+  
+  print(result)
+  cat("\n")
+}
+
+age_comparisons <- combn(levels(alpha_long_age$Age), 2, simplify = FALSE)
+
+# Step 6: Plot by Age
+alpha_plot_age <- ggplot(alpha_long_age, aes(x = Age, y = Value, fill = Age)) +
+  geom_boxplot(outlier.shape = 21, outlier.fill = "black") +
+  facet_wrap(~Metric, scales = "free", ncol = 2) +
+  labs(x = "Age (Months)", y = "Alpha Diversity", fill = "Age") +
+  ggtitle("Alpha Diversity Metrics by Age") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  ) +
+  guides(fill = guide_legend(title = "Age")) +
+  stat_compare_means(
+    comparisons = age_comparisons,
+    method = "wilcox.test",
+    label = "p.signif",
+    hide.ns = FALSE,     # Show comparisons that are not significant (Use TRUE to hide them)
+    step.increase = 0.2 # Increase vertical spacing of comparisons
+  )
+
+# View the plot
+alpha_plot_age
+
+
+```
+
+### Prevalence filtering graph (can do a few different filters) and normalization, TSS, log(TSS+pseudocount), CLR
+```{r}
+#CANOE_phy_3Runs_noneg is the phyloseq object currently!
+
+#  Calculating Prevalence, plotting each phylum to justify different prevalence cutoffs
+prevdf <- apply(X = otu_table(CANOE_phy_3Runs_noneg),
+                MARGIN = ifelse(taxa_are_rows(CANOE_phy_3Runs_noneg), yes = 1, no = 2),
+                FUN = function(x) { sum(x > 0) })
+prevdf <- data.frame(Prevalence = prevdf,
+                     TotalAbundance = taxa_sums(CANOE_phy_3Runs_noneg),
+                     as.data.frame(tax_table(CANOE_phy_3Runs_noneg)))
+  prevdf1 <- subset(prevdf, Phylum %in% get_taxa_unique(CANOE_phy_3Runs_noneg, "Phylum"))
+  p.prevdf1 <- ggplot(prevdf1, aes(TotalAbundance, Prevalence / nsamples(CANOE_phy_3Runs_noneg), color = Genus)) +
+    geom_hline(yintercept = 0.1, alpha = 0.5, linetype = 2) +
+    geom_point(size = 1.5, alpha = 0.7) +
+    scale_x_log10() +
+    xlab("Total Abundance") +
+    ylab("Prevalence [Frac. Samples]") +
+    facet_wrap(~Phylum) +
+    theme(legend.position = "none") +
+    ggtitle("Phylum Prevalence in All Samples\nColored by Genus")
+  print(p.prevdf1)
+```
+
+### Will try and rarefy here ###
+```{r}
+#Take CANOE_phy_3Runs_noneg and create a plot of unique ASV per read depth to get a proper cutoff for rarefaction.
+otu_3runs_noneg <- as.data.frame(otu_table(CANOE_phy_3Runs_noneg))
+rare_list <- rarecurve(otu_3runs_noneg, step = 100, sample = min(rowSums(otu_3runs_noneg)), label = FALSE)
+
+# Convert to dataframe for ggplot
+rare_df <- do.call(rbind, lapply(seq_along(rare_list), function(i) {
+  data.frame(
+    SampleID = rownames(otu_3runs_noneg)[i],
+    Depth    = attr(rare_list[[i]], "Subsample"),
+    Richness = rare_list[[i]]
+  )
+}))
+
+ggplot(rare_df, aes(x = Depth, y = Richness, group = SampleID, color = SampleID)) +
+  geom_line(alpha = 0.5, linewidth = 0.4) +
+  geom_vline(xintercept = 1000, color = "red", linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 5000)) +
+  scale_y_continuous(limits = c(0, 400)) +
+  labs(x = "Read Depth", y = "ASV Richness",
+       title = "Rarefaction Curves",
+       #subtitle = "Red line = candidate rarefaction depth") 
+       )+
+  theme_bw() +
+  theme(legend.position = "none")  # remove legend - too many samples to label usefully
+
+#Rarefy once to get a distribution:
+# Define rarefaction depths to test
+depths <- c(500, 1000, 2000, 3000)
+
+# Check total samples before rarefaction
+cat("Total samples before rarefaction:", nsamples(CANOE_phy_3Runs_noneg), "\n\n")
+
+# Loop through each depth
+for (d in depths) {
+  
+  # Identify which samples fall below this depth
+  sample_depths <- sample_sums(CANOE_phy_3Runs_noneg)
+  dropped <- sample_data(CANOE_phy_3Runs_noneg)[sample_depths < d, ]
+  kept <- sample_data(CANOE_phy_3Runs_noneg)[sample_depths >= d, ]
+  
+  cat("=== Rarefaction depth:", d, "===\n")
+  cat("Samples retained:", nrow(kept), "\n")
+  cat("Samples dropped:", nrow(dropped), "\n")
+  
+  if (nrow(dropped) > 0) {
+    cat("Dropped samples by Group:\n")
+    print(table(dropped$Group))  # replace Group with your actual column name
+  } else {
+    cat("No samples dropped\n")
+  }
+  
+  cat("Retained samples by Group:\n")
+  print(table(kept$Group))  # replace Group with your actual column name
+  cat("\n")
+}
+
+ps_rarefied_single <- rarefy_even_depth(CANOE_phy_3Runs_noneg,
+                                  sample.size = 1000,  # replace with your chosen depth
+                                  rngseed = 481516,
+                                  replace = FALSE,
+                                  trimOTUs = TRUE,
+                                  verbose = TRUE)
+
+ps_1_rarefy <- phyloseq(ps_rarefied_single <- phyloseq(
+  otu_table(ps_rarefied),                        # rarefied OTU table
+  sample_data(CANOE_phy_3Runs_noneg),            # original metadata
+  tax_table(CANOE_phy_3Runs_noneg),              # original taxonomy
+  phy_tree(CANOE_phy_3Runs_noneg)                # original tree
+))
+
+
+#then rarefy 100 times to compare. Choose the medoid to use as the distribution (more central to all others).
+set.seed(481516)  # for reproducibility
+n_reps <- 100
+depth <- 1000  # replace with your chosen depth
+
+# Store OTU tables from each rarefaction
+rarefied_list <- vector("list", n_reps)
+
+for (i in 1:n_reps) {
+  ps_rare_canoe <- rarefy_even_depth(CANOE_phy_3Runs_noneg, 
+                                sample.size = depth,
+                                rngseed = i,        # different seed each iteration
+                                replace = FALSE,
+                                trimOTUs = FALSE,
+                                verbose = FALSE)
+  rarefied_list[[i]] <- matrix(
+  as.integer(as.matrix(otu_table(ps_rare_canoe))),
+  nrow = ntaxa(ps_rare_canoe),
+  dimnames = list(taxa_names(ps_rare_canoe), sample_names(ps_rare_canoe))
+)
+}
+
+cat("Done rarefying\n")
+
+# Get sample names from first iteration
+sample_names_list <- colnames(rarefied_list[[1]])  # adjust if taxa_are_rows differs
+n_samples <- length(sample_names_list)
+
+# For each sample, find the rarefaction closest to the center of all 100
+medoid_otu <- matrix(0, 
+                     nrow = nrow(rarefied_list[[1]]), 
+                     ncol = n_samples,
+                     dimnames = list(rownames(rarefied_list[[1]]), 
+                                     sample_names_list))
+
+for (s in seq_along(sample_names_list)) {
+  
+  samp <- sample_names_list[s]
+  
+  # Extract this sample's profile across all 100 rarefactions
+  # Each row = one rarefaction, each column = one ASV
+  profiles <- do.call(rbind, lapply(rarefied_list, function(x) x[, samp]))
+  
+  # Compute Bray-Curtis distance between all 100 profiles for this sample
+  # Use Bray-Curtis for abundance, or "jaccard" for presence/absence
+  dist_matrix <- as.matrix(vegdist(profiles, method = "bray"))
+  
+  # Find medoid: the profile with minimum total distance to all others
+  total_dist <- rowSums(dist_matrix)
+  medoid_idx <- which.min(total_dist)
+  
+  # Store that profile
+  medoid_otu[, samp] <- profiles[medoid_idx, ]
+}
+
+cat("Medoid selection complete\n")
+
+asv_sums <- rowSums(medoid_otu)
+cat("ASVs before zero removal:", nrow(medoid_otu), "\n")
+
+medoid_otu_filtered <- medoid_otu[asv_sums > 0, ]
+cat("ASVs after zero removal:", nrow(medoid_otu_filtered), "\n")
+
+# Get surviving ASV names for subsetting tax_table and tree
+surviving_asvs <- rownames(medoid_otu_filtered)
+
+# Now rebuild phyloseq with filtered medoid_otu
+surviving_samples <- colnames(medoid_otu_filtered)
+sample_data_filtered <- sample_data(CANOE_phy_3Runs_noneg)[surviving_samples, ]
+
+ps_100_rarefied_medoid <- phyloseq(
+  otu_table(medoid_otu_filtered, taxa_are_rows = TRUE),
+  sample_data_filtered,
+  tax_table(CANOE_phy_3Runs_noneg)[surviving_asvs, ],
+  prune_taxa(surviving_asvs, phy_tree(CANOE_phy_3Runs_noneg))
+)
+
+
+# Verify dimensions all match
+cat("Samples in OTU table:", ncol(medoid_otu_filtered), "\n")
+cat("Samples in sample_data:", nrow(sample_data_filtered), "\n")
+cat("ASVs in OTU table:", nrow(medoid_otu_filtered), "\n")
+cat("ASVs in tax_table:", ntaxa(CANOE_phy_3Runs_noneg), "\n")
+
+# Check the object looks right
+ps_100_rarefied_medoid
+
+# Save
+saveRDS(ps_100_rarefied_medoid, "ps_100_rarefied_medoid_depth1000.rds")
+
+
+# Build each component separately first
+otu <- otu_table(medoid_otu_filtered, taxa_are_rows = TRUE)
+cat("OTU table built:", dim(otu), "\n")
+
+sdata <- sample_data_filtered
+cat("Sample data built:", dim(sdata), "\n")
+
+taxtab <- tax_table(CANOE_phy_3Runs_noneg)[surviving_asvs, ]
+cat("Tax table built:", dim(taxtab), "\n")
+
+tree <- prune_taxa(surviving_asvs, phy_tree(CANOE_phy_3Runs_noneg))
+cat("Tree built, tips:", length(tree$tip.label), "\n")
+
+# Now build phyloseq incrementally
+ps_test1 <- phyloseq(otu, sdata)
+cat("OTU + sample_data OK\n")
+
+ps_test2 <- phyloseq(otu, sdata, taxtab)
+cat("+ tax_table OK\n")
+
+ps_test3 <- phyloseq(otu, sdata, taxtab, tree)
+cat("+ tree OK\n")
+
+
+
+#Prevalence filter single rarefied and 100 rarefied phyloseq using function below:
+prevalence_filter <- function(phy, prev_frac = 0.1, min_reads = 10) {
+  # Keep taxa that occur in > prev_frac fraction of samples AND have > min_reads counts
+  phy_filt <- filter_taxa(
+    phy,
+    function(x) sum(x > min_reads) > (prev_frac * length(x)),
+    prune = TRUE
+  )
+    
+  # Identify and drop zero-count samples
+  zero_samples <- sample_names(phy_filt)[
+    rowSums(as(otu_table(phy_filt), "matrix")) == 0
+  ]
+  if (length(zero_samples) > 0) {
+    message("Dropping ", length(zero_samples), " zero-count samples: ",
+            paste(zero_samples, collapse = ", "))
+    phy_filt <- prune_samples(!sample_names(phy_filt) %in% zero_samples, phy_filt)
+  }
+  
+  return(phy_filt)
+}
+
+
+CANOE_prevfilt <- prevalence_filter(CANOE_phy_3Runs_noneg, 0.1, 1)
+
+phy_rarefy100_prevfilt <- prevalence_filter(ps_test3, 0.1, 1)
+
+
+#Determine how different ASV inclusion is, and show metric for variance in distribution between the three
+
+```
+
+### Prevalence Filter Results ###
+```{r}
+  # Apply 10% prevalence & >10 reads
+phy_prev_10O_10R <- prevalence_filter(CANOE_phy_3Runs_noneg, prev_frac = 0.1, min_reads = 10)
+
+  #pre: [ 14662 taxa and 891 samples ] 
+  #post: (10% prevalence and >10 reads):  [  118 taxa and 883 samples ] *** Chosen moving forward ***
+  #post: ( 5% prevalence and >10 reads):  [  237 taxa and 886 samples ] 
+  #post: ( 5% prevalence and > 1 reads):  [  261 taxa and 886 samples ]
+  #post: ( 1% prevalence and > 1 reads):  [ 1071 taxa and 890 samples ]
+saveRDS(phy_prev_10O_10R, "~/Downloads/Prevalence_Phyloseq_10_10.rds")
+
+# Now safely do TSS
+phy_tss <- transform_sample_counts(phy_prev_10O_10R, function(x) x / sum(x))
+
+### And log transform ONLY FOR RELATIVE ABUNDANCE TESTING!!! ###
+otumat <- as(phyloseq::otu_table(phy_tss), "matrix")
+pos_vals <- otumat[otumat > 0]
+if (length(pos_vals) == 0) {
+  stop("No positive values in OTU table; cannot compute pseudocount.")
+}
+pseudocount <- min(pos_vals, na.rm = TRUE) / 2
+#pseudocount
+phy_log_tss <- transform_sample_counts(phy_tss, function(x) log10(x + pseudocount))
+
+```
+
+```{r}
+### Choosing best fit for data ###
+
+# Step 1: Extract OTU table
+otu_mat <- as(otu_table(CANOE_phy_3Runs_noneg_filter_10O_10R), "matrix")
+if (taxa_are_rows(CANOE_phy_3Runs_noneg_filter_10O_10R)) {
+  otu_mat <- t(otu_mat)
+}
+
+# Step 2: Add pseudocount to avoid log(0)
+otu_mat_pseudo <- otu_mat + 1e-6  # or use your previously calculated pseudocount
+
+# Step 3: Apply CLR transformation
+clr_mat <- compositions::clr(otu_mat_pseudo)  # Transforms each row
+
+# Step 4 Reconstruct the phyloseq object with CLR-transformed data
+otu_clr <- otu_table(clr_mat, taxa_are_rows = FALSE)
+phy_clr <- phyloseq(otu_clr, sample_data(CANOE_phy_3Runs_noneg_filter_10O_10R), tax_table(CANOE_phy_3Runs_noneg_filter_10O_10R))
+
+otu_long_clr <- reshape2::melt(clr_mat)
+colnames(otu_long_clr) <- c("Sample", "Taxon", "CLR_Abundance")
+
+ggplot(otu_long_clr, aes(x = CLR_Abundance)) +
+  geom_histogram(bins = 100) +
+  ggtitle("CLR-transformed abundance distribution") +
+  xlab("CLR Abundance") +
+  ylab("Frequency")
+
+
+# Example for one taxon
+taxon_name <- "ASV_1"  # replace with taxon of interest
+df_lme_genus_test <- data.frame(
+  Abundance = otu_mat[, taxon_name],
+  LogAbundance = log10(otu_mat[, taxon_name] + pseudocount),
+  #chronic_rhinitis12m = sample_data(CANOE_phy_3Runs_noneg_filter_10O_10R)$chronic_rhinitis12m,
+  Age = sample_data(CANOE_phy_3Runs_noneg_filter_10O_10R)$Age,
+  Subject_ID = sample_data(CANOE_phy_3Runs_noneg_filter_10O_10R)$Subject_ID
+)
+colnames(df_lme_genus_test)[1:2] <- c("Abundance", "LogAbundance")
+
+# Model on raw TSS
+model_raw_genus <- lmer(Abundance ~ Age + (1 | Subject_ID), data = df_lme_genus_test)
+
+# Model on log-transformed TSS
+model_log_genus <- lmer(LogAbundance ~ Age + (1 | Subject_ID), data = df_lme_genus_test)
+
+
+# Create dataframe for CLR modeling
+df_lme_clr <- data.frame(
+  CLR_Abundance = otu_mat_clr[, taxon_name],
+  #chronic_rhinitis12m = sample_data(phy_clr)$chronic_rhinitis12m,
+  Age = sample_data(phy_clr)$Age,
+  Subject_ID = sample_data(phy_clr)$Subject_ID
+)
+
+# Fit CLR model (no need for log-transform since CLR is already log-scale)
+model_clr <- lmer(CLR_Abundance ~ Age + (1 | Subject_ID), data = df_lme_clr)
+
+# Residual diagnostics for CLR model
+par(mfrow=c(3,2))
+
+# Residual plots for raw model
+plot(resid(model_raw_genus), main="Residuals of raw TSS model")
+qqnorm(resid(model_raw_genus), main="QQ plot raw TSS model")
+qqline(resid(model_raw_genus))
+
+# Residual plots for log model
+plot(resid(model_log_genus), main="Residuals of log TSS model")
+qqnorm(resid(model_log_genus), main="QQ plot log TSS model")
+qqline(resid(model_log_genus))
+
+#Residual plots for CLR model
+plot(resid(model_clr), main="Residuals of CLR model")
+qqnorm(resid(model_clr), main="QQ plot CLR model")
+qqline(resid(model_clr))
+
+# Model comparison including CLR
+AIC(model_raw_genus, model_log_genus, model_clr)
+BIC(model_raw_genus, model_log_genus, model_clr)
+
+###Choosing 10% occurrance and > 10 reads because it includes the most abundant genus level ASVs while not inflating the total taxa present. Also choosing Log(TSS + pseudocount) as the phyloseq object to move forward with because of the lowest AIC, BIC values when plotting abundance lme. However, Beta Diversity will want only TSS, so will also make a cleanly named phyloseq object for that as well###
+
+```
+
+### Beta Diversity
+```{r}
+
+# 6 distances (Sørensen handled via presence/absence Bray)
+dists <- c(
+  "Weighted UniFrac"   = "wunifrac",
+  "Unweighted UniFrac" = "unifrac",
+  "Bray Curtis"        = "bray",
+  "Sorensen"           = "sorensen",
+  "Jaccard"            = "jaccard",
+  "Canberra"           = "canberra"
+)
+
+set.seed(481516)
+pnova_proj <- vector("list", length(dists))
+proj_plt   <- vector("list", length(dists))
+names(pnova_proj) <- names(dists)
+names(proj_plt)   <- names(dists)
+
+# Helper: get a distance object, returning a 'dist' for every method
+get_dm <- function(phy, method_key) {
+  if (method_key == "sorensen") {
+    # Sørensen ≡ Bray on presence/absence
+    vegan::vegdist(as(otu_table(phy), "matrix"), method = "bray", binary = TRUE)
+  } else if (method_key == "jaccard") {
+    # Jaccard on presence/absence
+    vegan::vegdist(as(otu_table(phy), "matrix"), method = "jaccard", binary = TRUE)
+  } else {
+    # Methods supported directly by phyloseq::distance
+    phyloseq::distance(phy, method = method_key)
+  }
+}
+
+for (i in seq_along(dists)) {
+  method_name <- names(dists)[i]   # pretty label
+  method_key  <- dists[i]          # code string
+
+  dm_group <- get_dm(phy_tss, method_key)
+
+  # PCoA: pass the 'dist' object directly (works for all cases)
+  pcoa <- ordinate(phy_tss, method = "PCoA", distance = dm_group)
+
+  # PERMANOVA: use proper sample_data extraction
+  md <- as(sample_data(phy_tss), "data.frame")
+  pnova_proj[[i]] <- adonis2(dm_group ~ Age, data = md)
+
+  plt <- plot_ordination(phy_tss, pcoa, type = "samples", color = "Group") +
+    stat_ellipse(linetype = 2) +
+    ggtitle(method_name) +
+    geom_point(size = 2) +
+    theme_bw() +
+    annotate("text", x = Inf, y = Inf,
+             label = paste('R^2==', round(pnova_proj[[i]]$R2[1], 3)),
+             hjust = 1, vjust = 1, parse = TRUE, size = 3) +
+    annotate("text", x = Inf, y = Inf,
+             label = paste('P==', round(pnova_proj[[i]]$`Pr(>F)`[1], 3)),
+             hjust = 1, vjust = 3.5, parse = TRUE, size = 3) +
+    theme(plot.title = element_text(color = "DarkBlue", size = 11, hjust = .5)) +
+    scale_color_manual(values = c(
+      "child - newborn"  = "#E31A1C",
+      "child - 4 months" = "#1F78B4",
+      "child - 12 months"= "green"
+    ))
+
+  proj_plt[[i]] <- plt
+}
+
+# 2x3 grid with shared legend at bottom
+BD_pcoa_plot <- ggarrange(
+  plotlist = proj_plt,
+  ncol = 3, nrow = 2,
+  common.legend = TRUE, legend = "bottom"
+)
+BD_pcoa_plot
+```

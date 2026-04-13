@@ -1,0 +1,1545 @@
+---
+title: "Elad_boruta"
+author: "Elad Deiss-Yehiely"
+date: "`r Sys.Date()`"
+output:   
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+
+##replace root.dir to whereever you have stored the data
+knitr::opts_knit$set(
+  root.dir = "~/Desktop/Postdoc UCSF/CANOE/Boruta Analysis"
+)
+setwd(knitr::opts_knit$get("root.dir"))  # sync interactive wd to knit root
+
+```
+
+```{r library loading, include=FALSE}
+### MUCH OF THIS SCRIPT IS TAKEN FROM HOLLY STEININGER FROM HER PUBLICATION ###
+
+rpkgs <- c("tidyverse", "data.table", "Boruta", "reshape2", "ggridges")
+
+#Run once per project
+#install.packages(rpkgs)
+
+for(package in rpkgs) {
+  do.call("library", list(package))
+ }
+
+```
+
+```{r data loading, include=FALSE}
+
+#/Users/hsteininger/Library/CloudStorage/Box-Box/Lynch_lab_Holly_Steininger/Mentorship/Elad/sample_metadata_table.txt
+
+otu_tss_Boruta <- read.delim(
+  "otu_abundance_table.txt",
+  sep = "\t",
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+) 
+
+metadata_Boruta <- read.delim(
+  "sample_metadata_table.txt",
+  sep = "\t",
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+tax_table_Boruta <- as.data.frame(tax_table(phy_tss_sub))
+
+
+```
+
+## Random Forest Feature Identification
+
+Identify ASV which distinguish chronic_rhinitis_36m_current children. 
+
+###Function
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+#---------------------------------------FUNCTION-------------------------
+
+#Function to aggregate the importance scores across multiple Random Forest runs with different tree numbers.
+aggregate_importance_scores <- function(importance_list) {
+  do.call(rbind, importance_list)
+}
+
+run_boruta <- function(data, target, n_trees, seed, maxRuns, return_model) {
+  set.seed(seed)
+  stopifnot(nrow(data) == length(target)) #fail if misaligned
+  data <- cbind(data, target = target)
+  data$target <- as.factor(data$target)
+
+  boruta_result <- Boruta(target ~ ., data = data, doTrace = 0, ntree = n_trees, maxRuns = maxRuns)
+  
+    if (return_model) {
+    return(boruta_result)
+  }
+
+  # Get long-form importance history
+  imp_hist <- as.data.frame(boruta_result$ImpHistory)
+  imp_hist$Iteration <- 1:nrow(imp_hist)
+  imp_long <- reshape2::melt(imp_hist, id.vars = "Iteration", variable.name = "Feature", value.name = "Importance")
+  imp_long <- imp_long[!is.na(imp_long$Importance), ]
+
+  # Compute z-scores per run
+  imp_long_z <- imp_long %>%
+    group_by(Iteration) %>%
+    mutate(
+      meanImp_z = (Importance - mean(Importance, na.rm = TRUE)) / sd(Importance, na.rm = TRUE),
+      NumTrees = n_trees,
+      Seed = seed,
+      FeatureType = ifelse(grepl("^shadow", Feature), "Shadow", "Real")
+    )
+
+    # Get Boruta decision per feature
+  decisions <- attStats(boruta_result)
+  decisions$Feature <- rownames(decisions)
+  decisions <- decisions[, c("Feature", "decision")]
+
+  imp_long_z <- left_join(imp_long_z, decisions, by = "Feature")
+
+  return(imp_long_z)
+}
+
+```
+
+##Prepare data for boruta
+
+```{r}
+canoe_phy_sparcc_tss <- transform_sample_counts(canoe_phy_sparcc, function(x) x / sum(x))
+
+phy_age12 <- subset_samples(canoe_phy_sparcc_tss, Age == 12)
+
+
+otu_tss_Boruta <- as.data.frame(otu_table(phy_age12))
+metadata_Boruta <- as.data.frame(sample_data(phy_age12))
+tax_table_Boruta <- as.data.frame(tax_table(phy_age12))
+
+data_Boruta <- otu_tss_Boruta
+#883 obs of 118 var
+
+### CHOOSE METADATA VARIABLE OF INTEREST HERE ###
+target_Boruta <- metadata_Boruta$chronic_rhinitis12m
+#logi [1:883]
+
+table(is.na(target_Boruta)) 
+#alrighty; 348 of the 883 samples is missing a value in chronic_rhinitis36m_current
+
+stopifnot(identical(rownames(otu_tss_Boruta), rownames(metadata_Boruta)))
+#all the rownames match 
+
+#make the target only those with chronic_rhinitis36m_current is not NA
+keep <- !is.na(target_Boruta)
+otu_filt_Boruta <- otu_tss_Boruta[keep, , drop = FALSE]
+target_filt <- target_Boruta[keep]
+
+##check them
+sum(is.na(target_filt))   # should be 0
+length(target_filt) #535
+dim(otu_filt_Boruta) #535 118
+
+data_Boruta <- otu_filt_Boruta
+target <- target_filt
+
+
+```
+
+
+```{r, run boruta}
+# # Define parameters
+n_trees_list <- seq(1000, 5000, by = 500)
+seeds <- c(11, 145, 224) # do all 3 when de-bugged
+maxRuns <- 200
+
+all_importance_scores <- list()
+
+#Run Boruta for each seed
+for (seed in seeds) {
+  cat("Running Boruta with seed:", seed, "\n")
+
+  # Run Boruta for all tree counts
+  importance_list <- lapply(n_trees_list, function(n_trees) {
+    cat("  - Running with", n_trees, "trees...\n")
+    run_boruta(data = data_Boruta, target = target, n_trees = n_trees, seed = seed, maxRuns = maxRuns, return_model = FALSE)
+  })
+
+  # Aggregate importance scores
+  combined_scores <- aggregate_importance_scores(importance_list)
+
+  # Add seed annotation
+  combined_scores$Seed <- seed  # Track which seed was used
+
+  # Store results
+  all_importance_scores[[as.character(seed)]] <- combined_scores
+}
+
+all_importance_scores
+
+#Combine results from all seeds into a single data frame
+boruta_asv_200_maxruns_chronicRhinitis_12current_12only <- do.call(rbind, all_importance_scores)
+
+#saveRDS(boruta_asv_200_maxruns_chronicRhinitis_12current_12only, file = "~/Desktop/Postdoc UCSF/CANOE/Boruta Analysis/Update_April2026/boruta_asv_200_maxruns_chronicRhinitis_36current_12only")
+
+
+#boruta_asv_200_maxruns_chronicRhinitis_36current <- readRDS("~/Desktop/Postdoc UCSF/CANOE/Boruta Analysis/Chronic Rhinitis 36m/Elad_boruta_chronicRhinitis36m.Rmd")
+
+# unique(boruta_species_200_maxruns$Feature[boruta_species_200_maxruns$decision == "Confirmed"])
+# [1] "Hungatella effluvii"             "Bacteroides cellulosilyticus"    "Parabacteroides merdae"         
+# [4] "Enterocloster aldenensis"        "Fusicatenibacter saccharivorans" "Clostridium paraputrificum"     
+# [7] NA   
+
+```
+
+###Ridge plot
+```{r, plot}
+# Add label for FeatureType (Real vs Shadow)
+boruta_ridges <- boruta_asv_200_maxruns_chronicRhinitis_12current_12only %>%
+  mutate(FeatureType = ifelse(grepl("^shadow", Feature), "Shadow", "Real"))
+
+boruta_ridges_filtered <- boruta_ridges %>%
+  filter(FeatureType == "Real" | Feature %in% c("shadowMin", "shadowMean", "shadowMax"))
+
+#Make a shadow max reference line
+  # Extract Z-scores for shadowMax only
+  shadow_max_zscores <- boruta_asv_200_maxruns_chronicRhinitis_12current_12only %>%
+    filter(Feature == "shadowMax") %>%
+    pull(meanImp_z)
+  
+  # Choose a threshold summary:
+  shadow_max_median <- median(shadow_max_zscores, na.rm = TRUE)
+  shadow_max_95 <- quantile(shadow_max_zscores, 0.95, na.rm = TRUE)
+
+# Get feature order by median z-score (ascending or descending) and apply
+feature_order <- boruta_ridges_filtered %>%
+    filter(is.finite(meanImp_z)) %>%                 # guard against Inf/NaN
+    group_by(Feature) %>%
+    summarise(Median = median(meanImp_z, na.rm = TRUE), .groups = "drop") %>%
+    arrange(Median) %>%                               # use arrange(desc(Median)) for highest on top
+    pull(Feature)
+  
+  #Apply as factor levels for plotting
+  boruta_ridges_filtered <- boruta_ridges_filtered %>%
+    mutate(Feature = factor(Feature, levels = feature_order))
+
+####
+# Final plot
+Boruta_species_ridge <- ggplot(boruta_ridges_filtered, aes(x = meanImp_z, y = Feature, fill = decision)) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, rel_min_height = 0.01, color = "black") +
+  scale_fill_manual(values = c(
+    "Confirmed" = "#FDE725FF", 
+    "Rejected" = "grey", 
+    "Tentative" = "#31688EFF",
+    "Shadow" = "#440154FF"
+  ),
+  labels = c(
+    "Confirmed" = "Confirmed (p < 0.01)",
+    "Rejected" = "Rejected (p > 0.99)",
+    "Tentative" = "Tentative (p: 0.01–0.99)",
+    "Shadow" = "Shadow (min, mean, or max of permuted features)"
+  )) +
+  geom_vline(xintercept = shadow_max_median, linetype = "dashed", color = "red") +
+  labs(
+    title = "Z-score Distributions of Real Features vs Shadow Features",
+    x = "Z-score",
+    y = NULL,
+    fill = "Feature Significance"
+  ) +
+  theme_ridges() +
+  theme(
+    legend.position = "top",
+    legend.direction = "vertical",
+    axis.text.y = element_text(face = "italic")
+  )
+
+Boruta_species_ridge
+
+ggsave("~/Desktop/Postdoc UCSF/CANOE/Boruta Analysis/Update_April2026/boruta_asv_200_maxruns_chronicRhinitis_12current_12only_test.png", plot = Boruta_species_ridge, width = 6, height = 20, units = "in", dpi = "print")
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+asvs_plot <- c("ASV_39","ASV_54","ASV_14","ASV_21","ASV_17","ASV_87","ASV_84")
+
+# metadata from sample_data (sam_sub)
+meta_plot <- meta %>%
+  tibble::rownames_to_column("SampleID") %>%
+  select(SampleID, Subject_ID, Group, chronic_rhinitis36m_current, chronic_rhinitis12m)
+  #select(SampleID, Subject_ID, Group, chronic_rhinitis36m_current, chronic_rhinitis12m, clust_sorensen_2)   # <-- change Participant_ID to your actual participant column name
+
+otu_tss_all <- as.data.frame(otu_table(canoe_phy_sparcc_tss))
+
+# abundances (assumes rows = samples, cols = ASVs)
+df_plot_Boruta <- otu_tss_all %>%
+  tibble::rownames_to_column("SampleID") %>%
+  select(SampleID, all_of(asvs_plot)) %>%
+  pivot_longer(all_of(asvs_plot), names_to = "ASV", values_to = "RelAbund") %>%
+  left_join(meta_plot, by = "SampleID") %>%
+  mutate(
+    Group = factor(Group),                  # optionally set levels
+    Subject_ID = factor(Subject_ID),
+    ASV = factor(ASV, levels = asvs_plot),
+    Chronic_Rhinitis_36m = factor(chronic_rhinitis36m_current),
+    Chronic_Rhinitis_12m = factor(chronic_rhinitis12m)
+    #Trajectory_Sorensen = factor(clust_sorensen_2)
+  )
+
+# Optional: enforce correct timepoint order (edit levels to yours)
+df_plot_Boruta$Group <- factor(
+  df_plot_Boruta$Group,
+  levels = c("child - newborn",
+             "child - 4 months",
+             "child - 12 months"),
+  labels = c("Newborn", "4 months", "12 months")
+)
+df_plot_Boruta$clust_sorensen_2 <- factor(df_plot_Boruta$clust_sorensen_2)
+
+
+
+# 3) Violin + participant directionality
+ggplot(df_plot_Boruta, aes(x = Group, y = RelAbund)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(aes(group = Subject_ID),
+              width = 0.12, alpha = 0.5, size = 1.5) +
+  geom_line(aes(group = Subject_ID,
+                color = clust_sorensen_2),
+            alpha = 0.4) +
+  scale_color_manual(values = c("1-1" = "#009E73",   # green (teal)
+                                "1-2" = "#D55E00")) + # red (vermillion) 
+  facet_wrap(~ ASV, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_bw() +
+  labs(x = "Timepoint (Group)",
+       y = "Relative abundance (TSS)",
+       color = "Trajectory")
+
+ggplot(df_plot_Boruta, aes(x = Group, y = RelAbund)) +
+  geom_violin(trim = FALSE) +
+  
+  # Points colored by trajectory
+  geom_jitter(
+    aes(group = Subject_ID,
+        color = clust_sorensen_2),
+    width = 0.12, alpha = 0.6, size = 1.5
+  ) +
+  
+  # Lines NOT colored
+  geom_line(
+    aes(group = Subject_ID),
+    color = "grey90",
+    alpha = 0.4
+  ) +
+  
+  scale_color_manual(values = c("1-1" = "#009E73",
+                                "1-2" = "#D55E00")) +
+  
+  facet_wrap(~ ASV, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_bw() +
+  labs(
+    x = "Timepoint (Group)",
+    y = "Relative abundance (TSS)",
+    color = "Trajectory"
+  )
+
+
+
+#3b) Trying to have side-by-side violin plots.
+df_asv32 <- df_plot_Boruta %>%
+  filter(ASV == "ASV_15") %>%
+  mutate(clust_sorensen_2 = factor(clust_sorensen_2, levels = c("1-1","1-2"))) %>%
+  mutate(Chronic_Rhinitis_12m = factor(Chronic_Rhinitis_12m, levels = c(TRUE, FALSE)))
+
+ggplot(
+  df_asv32,
+  aes(x = Group,
+      y = RelAbund,          # pseudocount for zeros
+      fill = Chronic_Rhinitis_12m)
+) +
+  geom_violin(
+    trim = FALSE,
+    position = position_dodge(width = 0.8)
+  ) +
+  geom_jitter(
+    aes(color = Chronic_Rhinitis_12m,
+        group = interaction(Subject_ID, Chronic_Rhinitis_12m)),
+    position = position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width  = 0.8
+    ),
+    alpha = 0.6,
+    size = 1.4
+  ) +
+  scale_fill_manual(values = c(
+    "TRUE"  = alpha("#D41159", 0.5),
+    "FALSE" = alpha("#006400", 0.5))) +
+  scale_color_manual(values = c("TRUE" = "#D41159",
+                                "FALSE" = "#006400")) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l") +
+  theme_bw() +
+  labs(
+    x = "Timepoint",
+    y = "Relative abundance",
+    title = expression("Longitudinal Relative Abundance of" ~ italic("Moraxella") ~ "_57"),
+    fill  = "Rhinitis at 12 months",
+    color = "Rhinitis at 12 months"
+  )
+
+
+#4) Check directionality of those with and without ASV of interest in chronic rhinitis
+df_plot_Boruta <- df_plot_Boruta %>%
+  filter(!is.na(Chronic_Rhinitis_12m))
+
+all_Boruta_plot <- 
+  ggplot(df_plot_Boruta %>% filter(ASV == "ASV_57"),
+       aes(x = chronic_rhinitis12m,
+           y = RelAbund)) +
+  geom_violin() +
+  geom_jitter(width = 0.1) +
+  scale_y_log10() +
+  theme_bw()
+
+all_Boruta_plot
+
+wilcox.test(RelAbund ~ Chronic_Rhinitis_12m,
+            data = df_plot_Boruta %>% 
+              filter(ASV == "ASV_57",
+                     Group == "12 months"))
+
+tmp_0 <- df_plot_Boruta %>%
+  filter(ASV == "ASV_83") %>%
+  filter(!is.na(Chronic_Rhinitis_36m)) %>%
+  filter(Group == "12 months") %>%
+  mutate(RelAbund_log = log10(RelAbund + 1e-6))
+
+glmer_log <- glmer(Chronic_Rhinitis_36m ~ RelAbund_log + (1|Subject_ID),
+               data = tmp_0,
+               family = binomial)
+
+summary(glmer_log)
+
+tmp2 <- tmp %>%
+  mutate(present = RelAbund > 0)
+
+fisher.test(table(tmp2$present, tmp2$Chronic_Rhinitis_36m))
+```
+
+```{r}
+df_asv25 <- df_plot_Boruta %>%
+  filter(ASV == "ASV_32") %>%
+  mutate(clust_sorensen_2 = factor(clust_sorensen_2,
+                                   levels = c("1-1","1-2"))) %>%
+  mutate(Chronic_Rhinitis_12m = factor(Chronic_Rhinitis_12m, levels = c(TRUE, FALSE)))
+
+wilcox_results <- df_asv25 %>%
+  group_by(Group) %>%
+  wilcox_test(RelAbund ~ Chronic_Rhinitis_12m) %>%
+  adjust_pvalue(method = "BH") %>%        # optional FDR correction
+  add_significance()
+
+wilcox_results
+
+
+
+#Start here
+df_asv83_nb <- df_plot_Boruta %>%
+  filter(
+    ASV == "ASV_83",
+    Group == "12 months"
+  ) %>%
+  mutate(
+    present = RelAbund > 0,
+    Chronic_Rhinitis_12m = factor(Chronic_Rhinitis_12m)
+  )
+
+df_positive <- df_asv83_nb %>%
+  filter(present)
+
+prev_model <- glm(
+  present ~ Chronic_Rhinitis_12m,
+  data = df_asv83_nb,
+  family = binomial
+)
+
+summary(prev_model)
+
+exp(cbind(
+  OR = coef(prev_model),
+  confint(prev_model)
+))
+
+
+
+abund_model <- lm(
+  RelAbund ~ Chronic_Rhinitis_12m,
+  data = df_positive
+)
+
+summary(abund_model)
+
+
+
+
+df_plot_Boruta %>%
+  filter(
+    ASV == "ASV_83",
+    Group == "12 months",              # or Timepoint if that is your column name
+    Chronic_Rhinitis_12m == TRUE
+  ) %>%
+  summarise(
+    n = n(),
+    mean = mean(RelAbund, na.rm = TRUE),
+    median = median(RelAbund, na.rm = TRUE),
+    sd = sd(RelAbund, na.rm = TRUE),
+    IQR = IQR(RelAbund, na.rm = TRUE),
+    min = min(RelAbund, na.rm = TRUE),
+    max = max(RelAbund, na.rm = TRUE)
+  )
+```
+```{r}
+asvs_interest <- c("ASV_335","ASV_57","ASV_25","ASV_15","ASV_83","ASV_73","ASV_169","ASV_32")
+
+library(dplyr)
+library(ggplot2)
+
+asv_to_genus <- c(
+  "ASV_335" = "Dermacoccaceae_335",
+  "ASV_57"  = "Moraxella_57",
+  "ASV_15"  = "Moraxella_15",
+  "ASV_25"  = "Moraxella_25",
+  "ASV_83"  = "Streptococcus_83",
+  "ASV_73"  = "Lactococcus_73",
+  "ASV_169" = "Actinobacteria_169",
+  "ASV_32"  = "Streptococcus_32"
+)
+
+timepoints_interest <- c("Newborn", "4 months", "12 months")
+
+prev_df_boruta <- df_plot_Boruta %>%
+  filter(
+    ASV %in% names(asv_to_genus),
+    Group %in% timepoints_interest
+  ) %>%
+  mutate(
+    present = RelAbund > 0,
+
+    # ✅ robust conversion from factor/logical/character to TRUE/FALSE factor
+    Rhinitis = as.character(Chronic_Rhinitis_12m),
+    Rhinitis = if_else(Rhinitis %in% c("TRUE", "True", "T", "1", "Yes", "YES"), "TRUE", "FALSE"),
+    Rhinitis = factor(Rhinitis, levels = c("TRUE", "FALSE")),
+
+    Group = factor(Group, levels = timepoints_interest),
+    ASV = factor(ASV, levels = rev(names(asv_to_genus)))  # ASV_335 at top
+  ) %>%
+  group_by(ASV, Group, Rhinitis) %>%
+  summarise(
+    prevalence = mean(present, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Time_Rhinitis = interaction(Group, Rhinitis, sep = " | "),
+    # ✅ levels must match "TRUE"/"FALSE"
+    Time_Rhinitis = factor(
+      Time_Rhinitis,
+      levels = as.vector(outer(timepoints_interest, c("TRUE","FALSE"), paste, sep = " | "))
+    )
+  )
+
+prev_df_boruta <- prev_df_boruta %>%
+  mutate(Rhinitis = recode(Rhinitis, "TRUE" = "True", "FALSE" = "False"))
+time_rh_levels <- as.vector(t(outer(timepoints_interest, c("True","False"), paste, sep = " | ")))
+prev_df_boruta <- prev_df_boruta %>%
+  mutate(
+    Time_Rhinitis = interaction(Group, Rhinitis, sep = " | "),
+    Time_Rhinitis = factor(Time_Rhinitis, levels = time_rh_levels)
+  )
+
+# Plot (same as before)
+ggplot(prev_df_boruta, aes(x = Time_Rhinitis, y = ASV, fill = prevalence)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = scales::percent(prevalence, accuracy = 1)), size = 3) +
+  scale_y_discrete(labels = function(x) asv_to_genus[x]) +
+  scale_fill_gradient(low = "white", high = "#D41159", limits = c(0, 1), name = "Prevalence") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(
+    x = "Timepoint | Chronic_Rhinitis_12m",
+    y = "Genus",
+    title = "ASV prevalence across timepoints, split by rhinitis status"
+  )
+
+
+
+
+
+
+
+
+# --- Inputs ---
+asv_to_genus <- c(
+  "ASV_39" = "Moraxella_39",
+  "ASV_54"  = "Streptococcus_54",
+  "ASV_14"  = "Moraxella_14",
+  "ASV_21"  = "Moraxella_21",
+  "ASV_17"  = "Streptococcus_17",
+  "ASV_87"  = "Corynebacterium_87",
+  "ASV_84" = "Veillonella_84"
+)
+
+timepoints_interest <- c("child - newborn", "child - 4 months", "child - 12 months")
+
+# --- Prep data (make Rhinitis robust even if factor) ---
+df_prev <- df_plot_Boruta %>%
+  filter(
+    ASV %in% names(asv_to_genus),
+    Group %in% timepoints_interest
+  ) %>%
+  mutate(
+    present = RelAbund > 0,
+    # robust: handles factor/logical/character encodings
+    Rhinitis = as.character(Chronic_Rhinitis_12m),
+    Rhinitis = if_else(Rhinitis %in% c("TRUE","True","T","1","Yes","YES"), "TRUE", "FALSE"),
+    Rhinitis = factor(Rhinitis, levels = c("TRUE","FALSE")),
+    Group    = factor(Group, levels = timepoints_interest),
+    ASV      = factor(ASV, levels = rev(names(asv_to_genus)))  # ASV_335 on top
+  )
+
+# --- 1) Prevalence for heatmap tiles ---
+prev_df <- df_prev %>%
+  group_by(ASV, Group, Rhinitis) %>%
+  summarise(
+    prevalence = mean(present, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Time_Rhinitis = interaction(Group, Rhinitis, sep = " | "),
+    # order: Newborn|TRUE, Newborn|FALSE, 3m|TRUE, 3m|FALSE, ...
+    Time_Rhinitis = factor(
+      Time_Rhinitis,
+      levels = as.vector(t(outer(timepoints_interest, c("TRUE","FALSE"), paste, sep = " | ")))
+    )
+  )
+
+# --- 2) Chi-square / Fisher per ASV x timepoint (TRUE vs FALSE) ---
+chi_df <- df_prev %>%
+  group_by(ASV, Group) %>%
+  group_modify(~{
+    tab <- table(.x$present, .x$Rhinitis)
+
+    # ensure 2x2 (present/absent x TRUE/FALSE)
+    if (!all(dim(tab) == c(2, 2))) {
+      return(tibble(test = NA_character_, p_value = NA_real_))
+    }
+
+    chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+
+    if (any(chi$expected < 5)) {
+      ft <- fisher.test(tab)
+      tibble(test = "Fisher", p_value = ft$p.value)
+    } else {
+      tibble(test = "Chi-squared", p_value = chi$p.value)
+    }
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    stars = case_when(
+      is.na(p_adj)   ~ "",
+      p_adj < 0.001  ~ "***",
+      p_adj < 0.01   ~ "**",
+      p_adj < 0.1   ~ "*",
+      TRUE           ~ ""
+    ),
+    # put star on the TRUE tile for that timepoint
+    Rhinitis = factor("TRUE", levels = c("TRUE","FALSE")),
+    Time_Rhinitis = interaction(Group, Rhinitis, sep = " | "),
+    Time_Rhinitis = factor(
+      Time_Rhinitis,
+      levels = as.vector(t(outer(timepoints_interest, c("TRUE","FALSE"), paste, sep = " | ")))
+    )
+  )
+
+# --- 3) Merge stars into a plotting layer (no need to merge into prev_df) ---
+ggplot(prev_df, aes(x = Time_Rhinitis, y = ASV, fill = prevalence)) +
+  geom_tile(color = "white") +
+
+  # ⭐ Stars centered inside TRUE tiles
+  geom_text(
+    data = chi_df,
+    aes(x = Time_Rhinitis, y = ASV, label = stars),
+    inherit.aes = FALSE,
+    size = 6,
+    fontface = "bold"
+  ) +
+
+  scale_y_discrete(labels = function(x) asv_to_genus[x]) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#D41159",
+    limits = c(0, 1),
+    name = "Prevalence"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    plot.title = element_text(size = 16),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = "Timepoint | Rhinitis_12m",
+    y = "Microbe Genus",
+    title = "Longitudinal ASV prevalence by rhinitis status",
+    subtitle = "Stars: Adjusted p-value within each timepoint"
+  )
+```
+```{r}
+#Rarefying for Faith's PD
+bootstrap_faith_pd_prune_each_iter <- function(phy, depth = 1000, B = 50, seed = 1,
+                                              include.root = FALSE, ci_level = 0.95,
+                                              verbose = TRUE) {
+  stopifnot(requireNamespace("phyloseq", quietly = TRUE))
+  stopifnot(requireNamespace("vegan", quietly = TRUE))
+  stopifnot(requireNamespace("picante", quietly = TRUE))
+  stopifnot(requireNamespace("ape", quietly = TRUE))
+  stopifnot(requireNamespace("dplyr", quietly = TRUE))
+
+  set.seed(seed)
+
+  # Keep only samples with enough depth
+  keep <- phyloseq::sample_sums(phy) >= depth
+  if (verbose) message("Keeping ", sum(keep), " / ", phyloseq::nsamples(phy), " samples with depth ≥ ", depth)
+  phy0 <- phyloseq::prune_samples(keep, phy)
+
+  # OTU table as samples x taxa (counts)
+  otu0 <- as(phyloseq::otu_table(phy0), "matrix")
+  if (phyloseq::taxa_are_rows(phy0)) otu0 <- t(otu0)
+
+  # Tree must exist
+  tree_full <- phyloseq::phy_tree(phy0)
+  if (is.null(tree_full)) stop("No phylogenetic tree found in phy_tree(phy). Faith's PD requires a tree.")
+
+  # Ensure OTU taxa match tree tip labels
+  # (Drop taxa not in tree, and drop tree tips not in OTU)
+  common_taxa <- intersect(colnames(otu0), tree_full$tip.label)
+  if (length(common_taxa) < 2) stop("Too few overlapping taxa between OTU table and tree after intersection.")
+  otu0 <- otu0[, common_taxa, drop = FALSE]
+  tree_full <- ape::keep.tip(tree_full, tip = common_taxa)
+
+  # Sanity: confirm all rows have >= depth
+  rs <- rowSums(otu0)
+  if (any(rs < depth)) {
+    stop("Some samples in otu0 have < depth after filtering; check orientation/data type.")
+  }
+
+  samp_ids <- rownames(otu0)
+  alpha <- 1 - ci_level
+  lo_q <- alpha / 2
+  hi_q <- 1 - alpha / 2
+
+  pd_mat <- matrix(NA_real_, nrow = B, ncol = nrow(otu0),
+                   dimnames = list(paste0("iter_", seq_len(B)), samp_ids))
+
+  # Main loop
+  for (b in seq_len(B)) {
+    # Rarefy: rows=samples, cols=taxa
+    otu_b <- vegan::rrarefy(otu0, sample = depth)
+
+    # ✅ Prune taxa absent in ALL samples this iteration
+    keep_taxa <- colSums(otu_b) > 0
+    otu_b2 <- otu_b[, keep_taxa, drop = FALSE]
+
+    # Handle pathological case (shouldn't happen, but safe)
+    if (ncol(otu_b2) < 2) {
+      pd_mat[b, ] <- NA_real_
+      next
+    }
+
+    # ✅ Prune tree to kept taxa
+    tree_b <- ape::keep.tip(tree_full, tip = colnames(otu_b2))
+
+    # Faith PD
+   pd_b <- picante::pd(otu_b2, tree_b, include.root = include.root)$PD
+
+# robust alignment
+if (!is.null(names(pd_b)) && all(samp_ids %in% names(pd_b))) {
+  pd_mat[b, ] <- pd_b[samp_ids]
+} else {
+  # assume pd_b is in the same order as rows of otu_b2
+  pd_mat[b, ] <- as.numeric(pd_b)
+}
+
+    if (verbose && (b %% max(1, floor(B/10)) == 0)) message("  Completed ", b, "/", B,
+                                                            " (kept taxa this iter: ", ncol(otu_b2), ")")
+  }
+
+  # Summaries per sample
+ pd_df <- as.data.frame(t(pd_mat)) %>%
+  tibble::rownames_to_column(var = "SampleID") %>%
+  dplyr::mutate(
+    Faith_PD_mean = rowMeans(dplyr::select(., dplyr::starts_with("iter_")), na.rm = TRUE),
+    Faith_PD_sd   = apply(dplyr::select(., dplyr::starts_with("iter_")), 1, sd, na.rm = TRUE),
+    Faith_PD_qlo  = apply(dplyr::select(., dplyr::starts_with("iter_")), 1, quantile,
+                          probs = lo_q, na.rm = TRUE, names = FALSE),
+    Faith_PD_qhi  = apply(dplyr::select(., dplyr::starts_with("iter_")), 1, quantile,
+                          probs = hi_q, na.rm = TRUE, names = FALSE)
+  ) %>%
+  dplyr::select(SampleID, Faith_PD_mean, Faith_PD_sd, Faith_PD_qlo, Faith_PD_qhi)
+  list(
+    phy_pruned = phy0,
+    pd_by_iter = pd_mat,
+    summary = pd_df
+  )
+ }
+
+res_rarefaction <- bootstrap_faith_pd_prune_each_iter(CANOE_phy_3Runs_noneg, depth = 3000, B = 20, seed = 481516)
+
+faith_summary <- res_rarefaction$summary
+summary(res_rarefaction$summary$Faith_PD_sd / res_rarefaction$summary$Faith_PD_mean)
+head(faith_summary)
+
+#phy_prev_rarefy_10O_2R <- prevalence_filter(CANOE_phy_3Runs_noneg_rarefy1000, prev_frac = 0.1, min_reads = 2)
+
+
+
+
+
+
+# --- set these to your real column names ---
+time_col  <- "Group"        # your timepoint column in sam_sub
+value_col <- "Faith_PD_mean"   # <-- CHANGE this to your Faith distance column name
+
+timepoints_interest <- c("child - newborn", "child - 4 months", "child - 12 months")
+
+df_long <- sam_sub %>%
+  filter(.data[[time_col]] %in% timepoints_interest) %>%
+  mutate(
+    Timepoint = factor(.data[[time_col]], levels = timepoints_interest),
+    clust_sorensen_2 = factor(clust_sorensen_2, levels = c("1-1","1-2"))
+  )
+
+# 1) Add bootstrapped Faith PD to your metadata table
+faith_summary <- res_rarefaction$summary  # has SampleID + Faith_PD_mean/SD/CI
+
+df_long <- sam_sub %>%
+  mutate(SampleID = rownames(.)) %>%                 # or your actual sample ID column
+  left_join(faith_summary, by = "SampleID") %>%
+  filter(.data[[time_col]] %in% timepoints_interest) %>%
+  mutate(
+    Timepoint = factor(.data[[time_col]], levels = timepoints_interest),
+    clust_sorensen_2 = factor(clust_sorensen_2, levels = c("1-1","1-2"))
+  )
+
+
+
+# 1) Summary for plotting (mean ± SE)
+sum_df <- df_long %>%
+  group_by(Timepoint, clust_sorensen_2) %>%
+  summarise(
+    n = sum(!is.na(.data[[value_col]])),
+    mean = mean(.data[[value_col]], na.rm = TRUE),
+    sd   = sd(.data[[value_col]], na.rm = TRUE),
+    se   = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+# 2) Cross-sectional p-values at each timepoint (Wilcoxon rank-sum)
+p_df <- df_long %>%
+  group_by(Timepoint) %>%
+  wilcox_test(reformulate("clust_sorensen_2", response = value_col)) %>%
+  mutate(
+    stars = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  left_join(
+    sum_df %>%
+      group_by(Timepoint) %>%
+      summarise(y = max(mean + se, na.rm = TRUE), .groups="drop"),
+    by = "Timepoint"
+  ) %>%
+  mutate(y = y * 1.08)
+
+# 3) Plot
+ggplot(sum_df, aes(x = Timepoint, y = mean, group = clust_sorensen_2, color = clust_sorensen_2)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.15) +
+ geom_text(
+  data = p_df,
+  aes(x = Timepoint, y = y, label = stars),
+  inherit.aes = FALSE,
+  size = 6,
+  fontface = "bold"
+) +
+  scale_color_manual(values = c("1-1" = "#006400", "1-2" = "#D41159")) +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Faith's phylogenetic distance",
+    color = "Trajectory",
+    title = "Longitudinal Faith's phylogenetic distance",
+    #subtitle = "Cross-sectional Wilcoxon p-values at each timepoint (1-1 vs 1-2)"
+  ) + 
+  theme_classic(base_size = 16) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 14),
+
+    axis.title.x = element_text(size = 16, margin = margin(t = 12)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 12)),
+
+    axis.text.x  = element_text(size = 14),
+    axis.text.y  = element_text(size = 14),
+
+    plot.title   = element_text(size = 18, face = "bold"),
+    plot.subtitle= element_text(size = 14, color = "grey30"),
+
+    panel.grid   = element_blank()
+  )
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# change this to your exact column name if needed
+outcome_col <- "Chronic_Rhinitis_12m"
+
+df_hm <- df_plot_Boruta %>%
+  filter(ASV == "ASV_15") %>%
+  mutate(
+    present = as.integer(RelAbund > 0),
+    Group = factor(Group, levels = c("Newborn", "4 months", "12 months"))
+  ) %>%
+  # keep one row per Subject_ID x Group (in case of duplicates)
+  group_by(Subject_ID, Group) %>%
+  summarise(
+    present = max(present, na.rm = TRUE),
+    Chronic_Rhinitis_12m = dplyr::first(.data[[outcome_col]]),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(Chronic_Rhinitis_12m))
+
+# Order participants by outcome (then by overall presence as a tie-breaker)
+subj_order <- df_hm %>%
+  group_by(Subject_ID) %>%
+  summarise(
+    Chronic_Rhinitis_12m = first(Chronic_Rhinitis_12m),
+    total_present = sum(present, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Chronic_Rhinitis_12m, desc(total_present)) %>%
+  pull(Subject_ID)
+
+df_hm <- df_hm %>%
+  mutate(Subject_ID = factor(Subject_ID, levels = subj_order))
+
+ggplot(df_hm, aes(x = Group, y = Subject_ID, fill = factor(present))) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_grid(Chronic_Rhinitis_12m ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = c("0" = "grey90", "1" = "black"),
+                    name = "ASV_15",
+                    labels = c("Absent", "Present")) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.spacing.y = unit(0.25, "lines")
+  ) +
+  labs(
+    x = "Timepoint",
+    y = "Participants (sorted)",
+    title = "ASV_15 presence/absence by participant, sorted by chronic rhinitis status"
+  )
+
+
+#All ASVs in one plot for change in rel. abund.
+ggplot(df_plot_Boruta, aes(x = Group, y = RelAbund)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(aes(group = Subject_ID),
+              width = 0.12, alpha = 0.5, size = 0.5) +
+  geom_line(aes(group = Subject_ID,
+                color = chronic_rhinitis12m),
+            alpha = 0.2) +
+  facet_wrap(~ ASV, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme_bw() +
+  labs(x = "Timepoint (Group)",
+       y = "Relative abundance (TSS)",
+       color = "Trajectory")
+
+
+library(dplyr)
+library(ggplot2)
+
+df_plot_Boruta %>%
+  filter(ASV == "ASV_57") %>%
+  ggplot(aes(x = Group, y = RelAbund)) +
+  
+  geom_violin(trim = FALSE, fill = "grey90", color = "grey50") +
+  
+  geom_jitter(
+    aes(
+      group = Subject_ID,
+      color = chronic_rhinitis12m
+    ),
+    width = 0.12,
+    alpha = 0.6,
+    size = 1.5
+  ) +
+  
+  geom_line(
+    aes(
+      group = Subject_ID,
+      color = chronic_rhinitis12m
+    ),
+    alpha = 0.5
+  ) +
+  
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 0.1)
+  ) +
+  
+  theme_bw() +
+  
+  labs(
+    x = "Timepoint (Group)",
+    y = "Relative abundance (TSS)",
+    color = "Chronic Rhinitis"
+  )
+
+
+
+
+
+make_asv_presence_heatmap <- function(df,
+                                      asv = "ASV_57",
+                                      outcome_col,
+                                      group_col = "Group",
+                                      subject_col = "Subject_ID",
+                                      relabund_col = "RelAbund",
+                                      group_levels = c("Newborn", "4 months", "12 months"),
+                                      group_labels = group_levels,
+                                      sort_outcome_levels = NULL,
+                                      colors = c("0" = "grey90", "1" = "black"),
+                                      show_subject_ids = FALSE,
+                                      title = NULL) {
+
+  stopifnot(is.data.frame(df))
+  stopifnot(all(c("ASV", outcome_col, group_col, subject_col, relabund_col) %in% colnames(df)))
+
+  library(dplyr)
+  library(ggplot2)
+
+  # ----------------------------
+  # Build base heatmap dataframe
+  # ----------------------------
+  df_hm <- df %>%
+    filter(.data$ASV == asv) %>%
+    mutate(
+      present = as.integer(.data[[relabund_col]] > 0),
+      !!group_col := factor(.data[[group_col]],
+                            levels = group_levels,
+                            labels = group_labels)
+    ) %>%
+    group_by(.data[[subject_col]], .data[[group_col]]) %>%
+    summarise(
+      present = max(present, na.rm = TRUE),
+      outcome = first(.data[[outcome_col]]),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(outcome))
+
+  # Outcome ordering
+  if (!is.null(sort_outcome_levels)) {
+    df_hm <- df_hm %>%
+      mutate(outcome = factor(outcome, levels = sort_outcome_levels))
+  } else {
+    df_hm <- df_hm %>% mutate(outcome = factor(outcome))
+  }
+
+  # ----------------------------
+  # Order subjects (y-axis)
+  # ----------------------------
+  subj_order <- df_hm %>%
+    group_by(.data[[subject_col]]) %>%
+    summarise(
+      outcome = first(outcome),
+      total_present = sum(present, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(outcome, desc(total_present)) %>%
+    pull(.data[[subject_col]])
+
+  df_hm <- df_hm %>%
+    mutate(!!subject_col := factor(.data[[subject_col]], levels = subj_order))
+
+  # ----------------------------
+  # % present labels per facet × age
+  # ----------------------------
+  df_pct <- df_hm %>%
+    group_by(outcome, .data[[group_col]]) %>%
+    summarise(
+      n_present = sum(present),
+      n_total   = n(),
+      pct       = 100 * n_present / n_total,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      label = sprintf("%d%%", round(pct)),
+      y = Inf   # place at top of each facet
+    )
+
+  if (is.null(title)) {
+    title <- paste0(asv, " presence/absence (% present) across ages")
+  }
+
+  # ----------------------------
+  # Plot
+  # ----------------------------
+  ggplot(df_hm, aes(x = .data[[group_col]],
+                    y = .data[[subject_col]],
+                    fill = factor(present))) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    facet_grid(outcome ~ ., scales = "free_y", space = "free_y") +
+    geom_text(
+      data = df_pct,
+      aes(x = .data[[group_col]], y = y, label = label),
+      inherit.aes = FALSE,
+      vjust = 1.3,
+      size = 3.2
+    ) +
+    scale_fill_manual(
+      values = colors,
+      name = asv,
+      labels = c("Absent", "Present")
+    ) +
+    theme_bw() +
+    theme(
+      panel.spacing.y = grid::unit(0.25, "lines"),
+      axis.text.y = if (show_subject_ids) element_text(size = 6) else element_blank(),
+      axis.ticks.y = if (show_subject_ids) element_line() else element_blank()
+    ) +
+    labs(
+      x = "Age",
+      y = "Participants (sorted)",
+      title = title
+    )
+}
+
+
+make_asv_presence_heatmap(
+  df_plot_Boruta,
+  asv = "ASV_57",
+  outcome_col = "Chronic_Rhinitis_12m"
+)
+
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+asv_to_genus <- c(
+  "ASV_335" = "Dermacoccaceae",
+  "ASV_57"  = "Moraxella_57",
+  "ASV_15"  = "Moraxella_15",
+  "ASV_25"  = "Moraxella_25",
+  "ASV_83"  = "Streptococcus_83",
+  "ASV_73"  = "Lactococcus_73",
+  "ASV_169" = "Actinobacteria_169",
+  "ASV_32"  = "Streptococcus_32"
+)
+
+
+
+# ASVs of interest (as in df_plot_Boruta$ASV)
+asvs <- paste0("ASV_", c(335, 57, 15, 25, 83, 73, 169, 32))
+
+# 1) Build wide presence/absence matrix per sample
+pa_wide <- df_plot_Boruta %>%
+  filter(ASV %in% asvs) %>%
+  mutate(present = as.integer(RelAbund > 0)) %>%
+  group_by(SampleID, ASV) %>%                       # if you don't have SampleID, use rownames you created earlier
+  summarise(present = max(present, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = ASV, values_from = present, values_fill = 0)
+
+# 2) Pairwise Fisher test → log OR + p-values
+pairs <- combn(asvs, 2, simplify = FALSE)
+
+pair_stats <- lapply(pairs, function(p) {
+  a <- p[1]; b <- p[2]
+  tab <- table(pa_wide[[a]], pa_wide[[b]])
+
+  # fisher test can fail if table is degenerate; handle safely
+  ft <- tryCatch(fisher.test(tab), error = function(e) NULL)
+
+  data.frame(
+    ASV1 = a,
+    ASV2 = b,
+    odds_ratio = if (!is.null(ft)) unname(ft$estimate) else NA_real_,
+    p_value = if (!is.null(ft)) ft$p.value else NA_real_
+  )
+}) %>% bind_rows() %>%
+  mutate(
+    log_or = log(odds_ratio),
+    fdr = p.adjust(p_value, method = "BH"),
+    sig = fdr < 0.01
+  )
+
+# 3) Make a symmetric matrix for plotting
+mat_df <- pair_stats %>%
+  select(ASV1, ASV2, log_or, sig, fdr) %>%
+  bind_rows(
+    pair_stats %>% transmute(ASV1 = ASV2, ASV2 = ASV1, log_or, sig, fdr)
+  ) %>%
+  # add diagonal
+  bind_rows(data.frame(ASV1 = asvs, ASV2 = asvs, log_or = 0, sig = FALSE, fdr = NA_real_)) %>%
+  mutate(
+    ASV1 = factor(ASV1, levels = asvs),
+    ASV2 = factor(ASV2, levels = asvs)
+  )
+
+# 3b) Relabel ASVs to Genus
+mat_df <- mat_df %>%
+  mutate(
+    ASV1_label = ifelse(ASV1 %in% names(asv_to_genus),
+                        asv_to_genus[ASV1],
+                        ASV1),
+    ASV2_label = ifelse(ASV2 %in% names(asv_to_genus),
+                        asv_to_genus[ASV2],
+                        ASV2)
+  )
+label_levels <- unname(asv_to_genus[asvs])
+
+mat_df <- mat_df %>%
+  mutate(
+    ASV1_label = factor(ASV1_label, levels = label_levels),
+    ASV2_label = factor(ASV2_label, levels = label_levels)
+  )
+
+
+
+# 4) Plot heatmap using the label columns
+ggplot(mat_df, aes(x = ASV1_label, y = ASV2_label, fill = log_or)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_point(
+    data = subset(mat_df, sig & ASV1 != ASV2),
+    aes(x = ASV1_label, y = ASV2_label),
+    inherit.aes = FALSE,
+    size = 1.6
+  ) +
+  scale_fill_gradient2(midpoint = 0, name = "log(OR)") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    title = "ASV co-occurrence (presence/absence)",
+    subtitle = "log(odds ratio) from Fisher's exact test; dots indicate FDR < 0.01"
+  )
+
+
+
+library(dplyr)
+library(ggplot2)
+
+make_asv_violin_2x3_TSS_present <- function(df,
+                                            asv = "ASV_57",
+                                            outcome_col,
+                                            group_col = "Group",
+                                            subject_col = "Subject_ID",
+                                            relabund_col = "RelAbund",
+                                            group_levels = c("Newborn", "4 months", "12 months"),
+                                            group_labels = group_levels,
+                                            title = NULL) {
+
+  stopifnot(all(c("ASV", outcome_col, group_col, subject_col, relabund_col) %in% colnames(df)))
+
+  dat <- df %>%
+    filter(ASV == asv) %>%
+    filter(!is.na(.data[[outcome_col]])) %>%
+    filter(.data[[relabund_col]] > 0) %>%          # <-- remove zeros
+    mutate(
+      outcome = factor(.data[[outcome_col]]),
+      !!group_col := factor(.data[[group_col]],
+                            levels = group_levels,
+                            labels = group_labels)
+    )
+
+  if (is.null(title)) {
+    title <- paste0(asv, " relative abundance among carriers")
+  }
+
+  ggplot(dat, aes(x = !!sym(group_col), y = .data[[relabund_col]])) +
+    facet_grid(outcome ~ .) +   # 2 rows (outcome), 3 columns via x
+    geom_violin(trim = FALSE) +
+    geom_jitter(width = 0.12, alpha = 0.6, size = 1.3) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1)) +
+    labs(
+      x = "Age",
+      y = "Relative abundance (TSS, % among present)",
+      title = title
+    )
+}
+
+
+make_asv_violin_2x3_TSS_present(
+  df_plot_Boruta,
+  asv = "ASV_57",
+  outcome_col = "Chronic_Rhinitis_12m"
+)
+
+```
+
+```{r}
+### Trying Co-occurrance relationship for the ASVs from Boruta using relative abundances, not just presence absence ###
+
+library(dplyr)
+library(tidyr)
+
+asvs <- paste0("ASV_", c(335, 57, 15, 25, 83, 73, 169, 32))
+
+ra_wide <- df_plot_Boruta %>%
+  filter(ASV %in% asvs) %>%
+  group_by(SampleID, ASV) %>%
+  summarise(RelAbund = mean(RelAbund, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = ASV, values_from = RelAbund, values_fill = 0)
+
+
+pairs <- combn(asvs, 2, simplify = FALSE)
+
+pair_stats <- lapply(pairs, function(p) {
+  a <- p[1]; b <- p[2]
+
+  ct <- suppressWarnings(
+    cor.test(ra_wide[[a]], ra_wide[[b]], method = "spearman", exact = FALSE)
+  )
+
+  data.frame(
+    ASV1 = a,
+    ASV2 = b,
+    rho = unname(ct$estimate),
+    p_value = ct$p.value
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    fdr = p.adjust(p_value, method = "BH"),
+    sig = fdr < 0.01
+  )
+
+mat_df <- pair_stats %>%
+  select(ASV1, ASV2, rho, sig, fdr) %>%
+  bind_rows(
+    pair_stats %>% transmute(ASV1 = ASV2, ASV2 = ASV1, rho, sig, fdr)
+  ) %>%
+  bind_rows(data.frame(ASV1 = asvs, ASV2 = asvs, rho = 1, sig = FALSE, fdr = NA_real_)) %>%
+  mutate(
+    ASV1 = factor(ASV1, levels = asvs),
+    ASV2 = factor(ASV2, levels = asvs)
+  )
+
+library(stringr)
+
+label_levels_raw <- unname(asv_to_genus[asvs])
+
+italicize_genus <- function(x) {
+  # x like "Moraxella_335" → "<i>Moraxella</i>_335"
+  genus <- str_replace(x, "_.*$", "")
+  suffix <- str_replace(x, "^[^_]+", "")  # keeps "_335"
+  paste0("<i>", genus, "</i>", suffix)
+}
+
+label_levels_md <- vapply(label_levels_raw, italicize_genus, character(1))
+
+mat_df <- mat_df %>%
+  mutate(
+    ASV1_label = ifelse(ASV1 %in% names(asv_to_genus), asv_to_genus[ASV1], ASV1),
+    ASV2_label = ifelse(ASV2 %in% names(asv_to_genus), asv_to_genus[ASV2], ASV2),
+    ASV1_label = factor(ASV1_label, levels = label_levels_raw),
+    ASV2_label = factor(ASV2_label, levels = label_levels_raw)
+  ) %>%
+  mutate(
+    ASV1_label_md = factor(label_levels_md[match(ASV1_label, label_levels_raw)], levels = label_levels_md),
+    ASV2_label_md = factor(label_levels_md[match(ASV2_label, label_levels_raw)], levels = label_levels_md)
+  )
+
+library(ggplot2)
+library(ggtext)
+
+correlation_matrix <- ggplot(mat_df, aes(x = ASV1_label_md, y = ASV2_label_md, fill = rho)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_point(
+    data = subset(mat_df, sig & ASV1 != ASV2),
+    aes(x = ASV1_label_md, y = ASV2_label_md),
+    inherit.aes = FALSE,
+    size = 2.2    # slightly larger dots too (optional)
+  ) +
+  scale_fill_gradient2(midpoint = 0, name = "Spearman ρ", limits = c(-1, 1)) +
+  theme_bw() +
+  theme(
+    axis.text.x = ggtext::element_markdown(
+      angle = 45,
+      hjust = 1,
+      size = 14        # ⬅ increase ASV label size
+    ),
+    axis.text.y = ggtext::element_markdown(
+      size = 14        # ⬅ increase ASV label size
+    ),
+    plot.title = element_text(
+      size = 18,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      size = 14
+    ),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    title = "ASV Co-occurrence within CANOE Cohort",
+    subtitle = "Spearman correlation (ρ); dots indicate FDR < 0.01"
+  )
+
+
+
+
+
+library(lme4)
+library(dplyr)
+
+boruta_asvs <- paste0("ASV_", c(335, 57, 15, 25, 83, 73, 169, 32))
+
+
+meta_boruta_df <- sam_sub %>%
+  as.data.frame() %>%
+  transmute(
+    SampleID,
+    Site = canoe_site,
+    Sex = sex
+  )
+
+
+df_all_boruta <- df_plot_Boruta %>%
+  left_join(meta_boruta_df, by = "SampleID") %>%
+  filter(!is.na(chronic_rhinitis12m)) %>%
+  mutate(
+    Site = factor(Site),
+    Sex = factor(Sex),
+    RelAbund_log = log10(RelAbund + 1e-6)
+  )
+
+
+results_glmm <- lapply(boruta_asvs, function(a) {
+
+  tmp <- df_all_boruta %>% filter(ASV == a)
+
+  fit <- glmer(
+    chronic_rhinitis12m ~ RelAbund + Site + Sex + (1 | Subject_ID),
+    data = tmp,
+    family = binomial,
+    control = glmerControl(optimizer = "bobyqa")
+  )
+
+  beta <- fixef(fit)["RelAbund"]
+  se <- sqrt(diag(vcov(fit)))["RelAbund"]
+
+  data.frame(
+    ASV = a,
+    beta = beta,
+    OR = exp(beta),
+    p_value = 2 * (1 - pnorm(abs(beta / se)))
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    fdr = p.adjust(p_value, method = "BH"),
+    direction = case_when(
+      beta > 0 ~ "Risk-associated",
+      beta < 0 ~ "Protective",
+      TRUE ~ "Neutral"
+    )
+  )
+
+
+
+#Rel_Abund_Pct
+
+results_glmm <- lapply(boruta_asvs, function(a) {
+
+  tmp <- df_all_boruta %>%
+    filter(ASV == a) %>%
+    mutate(RelAbund_pct = RelAbund * 100)
+
+  fit <- tryCatch(
+    glmer(
+      chronic_rhinitis12m ~ RelAbund_pct + Site + Sex + (1 | Subject_ID),
+      data = tmp,
+      family = binomial,
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    return(data.frame(
+      ASV = a, beta = NA_real_, OR = NA_real_, p_value = NA_real_
+    ))
+  }
+
+  beta <- unname(fixef(fit)["RelAbund_pct"])
+  se   <- unname(sqrt(diag(vcov(fit)))["RelAbund_pct"])
+
+  z <- beta / se
+  p <- 2 * (1 - pnorm(abs(z)))
+
+  data.frame(
+    ASV = a,
+    beta = beta,
+    OR = exp(beta),
+    p_value = p
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    fdr = p.adjust(p_value, method = "BH"),
+    direction = case_when(
+      is.na(beta) ~ NA_character_,
+      beta > 0 ~ "Risk-associated",
+      beta < 0 ~ "Protective",
+      TRUE ~ "Neutral"
+    )
+  )
+results_glmm
+
+
+```
